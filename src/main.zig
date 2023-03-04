@@ -6,6 +6,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const StringSet = std.StringHashMapUnmanaged(void);
+const assert = std.debug.assert;
 
 fn usage() void {
     const text =
@@ -208,7 +209,7 @@ const Converter = struct {
                         .camel => {
                             try std_out.writeByte(0o033);
                             try std_out.writeAll("[31;4m");
-                            try convert_babby(tok.bytes, std_out);
+                            try convert_case(tok.bytes, std_out);
                             try std_out.writeByte(0o033);
                             try std_out.writeAll("[0m");
                         },
@@ -216,7 +217,7 @@ const Converter = struct {
                             if (self.adult_camels) {
                                 try std_out.writeByte(0o033);
                                 try std_out.writeAll("[33;4m");
-                                try convert_pappy(tok.bytes, std_out);
+                                try convert_case(tok.bytes, std_out);
                                 try std_out.writeByte(0o033);
                                 try std_out.writeAll("[0m");
                             } else {
@@ -254,30 +255,69 @@ const Converter = struct {
     }
 };
 
-fn convert_babby(token: []const u8, writer: anytype) !void {
-    for (token) |c| {
-        if (std.ascii.isUpper(c)) {
-            try writer.writeByte('_');
-            try writer.writeByte(std.ascii.toLower(c));
+fn convert_case(token: []const u8, writer: anytype) !void {
+    const isUpper = std.ascii.isUpper;
+    const isLower = std.ascii.isLower;
+    const toLower = std.ascii.toLower;
+
+    assert(token.len > 0);
+    try writer.writeByte(token[0]);
+    if (token.len == 1) return;
+
+    // First character defines whether this is lowerCamel or UpperCamel
+    const adult = isUpper(token[0]);
+    var prev_was_upper = adult;
+    for (token[1..], 1..) |c, i| {
+        var is_boundary = false;
+        if (isUpper(c)) {
+            if (!prev_was_upper) {
+                // myFunc
+                //   ^
+                is_boundary = true;
+            } else if (i + 1 < token.len and isLower(token[i + 1])) {
+                // myAPIFunc
+                //      ^
+                is_boundary = true;
+            }
+            prev_was_upper = true;
         } else {
-            try writer.writeByte(c);
+            prev_was_upper = false;
         }
+        if (is_boundary and token[i - 1] != '_') {
+            try writer.writeByte('_');
+        }
+        try writer.writeByte(if (adult) c else toLower(c));
     }
 }
 
-fn convert_pappy(token: []const u8, writer: anytype) !void {
-    var prev_was_lower = false;
-    for (token) |c| {
-        if (std.ascii.isUpper(c)) {
-            if (prev_was_lower) {
-                try writer.writeByte('_');
-                prev_was_lower = false;
-            }
-        } else {
-            prev_was_lower = true;
-        }
-        try writer.writeByte(c);
-    }
+test "convert case" {
+    try testConvert("x", "x");
+    try testConvert("already_snake", "already_snake");
+    try testConvert("myFunc", "my_func");
+    try testConvert("myIFunc", "my_i_func");
+    try testConvert("myAPIFunc", "my_api_func");
+    try testConvert("libC", "lib_c");
+    try testConvert("libCPP", "lib_cpp");
+    try testConvert("libZ2", "lib_z2");
+    try testConvert("libX2StuffY", "lib_x2_stuff_y");
+
+    try testConvert("X", "X");
+    try testConvert("Already_Snake", "Already_Snake");
+    try testConvert("MyFunc", "My_Func");
+    try testConvert("MyIFunc", "My_I_Func");
+    try testConvert("MyAPIFunc", "My_API_Func");
+    try testConvert("LibC", "Lib_C");
+    try testConvert("LibCPP", "Lib_CPP");
+    try testConvert("LibZ2", "Lib_Z2");
+    try testConvert("LibX2StuffY", "Lib_X2_Stuff_Y");
+    try testConvert("LLVMLibC", "LLVM_Lib_C");
+}
+
+fn testConvert(token: []const u8, expected: []const u8) !void {
+    var buf: [100]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try convert_case(token, fbs.writer());
+    try testing.expectEqualStrings(expected, fbs.getWritten());
 }
 
 const Tokenizer = struct {
@@ -369,3 +409,41 @@ const Tokenizer = struct {
         }
     }
 };
+
+test "tokenize" {
+    try testTokenize(
+        \\ [] {} 1234 fn
+        \\   babbyFunc.ComplexPappy,x_qwfpgjl
+        \\%SixtyFour();
+    ,
+        &.{
+            .{ .tag = .other_stuff, .bytes = " [] {} 1234 " },
+            .{ .tag = .ident_ish, .bytes = "fn" },
+            .{ .tag = .other_stuff, .bytes = "\n   " },
+            .{ .tag = .camel, .bytes = "babbyFunc" },
+            .{ .tag = .other_stuff, .bytes = "." },
+            .{ .tag = .adult_camel, .bytes = "ComplexPappy" },
+            .{ .tag = .other_stuff, .bytes = "," },
+            .{ .tag = .ident_ish, .bytes = "x_qwfpgjl" },
+            .{ .tag = .other_stuff, .bytes = "\n%" },
+            .{ .tag = .adult_camel, .bytes = "SixtyFour" },
+            .{ .tag = .other_stuff, .bytes = "();" },
+        },
+    );
+}
+
+fn testTokenize(src: []const u8, expected: []const Tokenizer.Token) !void {
+    var list = std.ArrayList(Tokenizer.Token).init(testing.allocator);
+    defer list.deinit();
+    var tokenizer = Tokenizer.init(src);
+    while (tokenizer.next()) |tok| {
+        try list.append(tok);
+    }
+    try testing.expectEqual(expected.len, list.items.len);
+    for (list.items, expected) |actual, expect| {
+        try testing.expectEqual(expect.tag, actual.tag);
+        try testing.expectEqualStrings(expect.bytes, actual.bytes);
+    }
+}
+
+const testing = std.testing;
