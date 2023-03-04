@@ -64,6 +64,7 @@ pub fn main() !void {
     var converter = Converter.init(allocator);
     defer converter.deinit();
 
+    var action: Action = .convert;
     var no_more_options = false;
     for (args[1..]) |arg| {
         if (no_more_options) {
@@ -76,9 +77,9 @@ pub fn main() !void {
             usage();
             return;
         } else if (mem.eql(u8, arg, "--dry-run")) {
-            converter.action = .dry_run;
+            action = .dry_run;
         } else if (mem.eql(u8, arg, "--dry-run-highlight")) {
-            converter.action = .highlight;
+            action = .highlight;
         } else if (mem.eql(u8, arg, "--adult-camels")) {
             converter.adult_camels = true;
         } else if (mem.eql(u8, arg, "--convert-all")) {
@@ -109,8 +110,14 @@ pub fn main() !void {
         os.exit(1);
     }
 
-    try converter.convert(paths.items);
+    try converter.process_files(paths.items, action);
 }
+
+const Action = enum {
+    dry_run,
+    highlight,
+    convert,
+};
 
 const Converter = struct {
     arena: ArenaAllocator,
@@ -120,7 +127,6 @@ const Converter = struct {
     ignore_ident_set: StringSet,
     convert_by_default: bool,
     adult_camels: bool,
-    action: enum { dry_run, highlight, convert },
 
     pub fn init(allocator: Allocator) Converter {
         return .{
@@ -131,7 +137,6 @@ const Converter = struct {
             .ignore_ident_set = .{},
             .convert_by_default = false,
             .adult_camels = false,
-            .action = .convert,
         };
     }
 
@@ -139,13 +144,13 @@ const Converter = struct {
         self.arena.deinit();
     }
 
-    pub fn convert(self: *Converter, paths: []const []const u8) !void {
+    pub fn process_files(self: *Converter, paths: []const []const u8, action: Action) !void {
         for (paths) |path| {
             try self.scan_path(fs.cwd(), path);
         }
         var key_iter = self.to_convert_file_set.keyIterator();
         while (key_iter.next()) |path| {
-            try self.convert_file(path.*);
+            try self.process_file(path.*, action);
         }
     }
 
@@ -237,67 +242,74 @@ const Converter = struct {
         }
     }
 
-    fn convert_file(self: *Converter, path: []const u8) !void {
+    fn process_file(self: *Converter, path: []const u8, action: Action) !void {
         const allocator = self.arena.child_allocator;
         const src = try fs.cwd().readFileAlloc(allocator, path, 10_000_000);
         defer allocator.free(src);
 
         const std_out = std.io.getStdOut().writer();
-        var tokenizer = Tokenizer.init(src);
-        switch (self.action) {
+        switch (action) {
             .dry_run => {
-                while (tokenizer.next()) |tok| {
-                    switch (tok.tag) {
-                        .camel, .adult_camel => {
-                            if (self.should_convert(tok.bytes)) {
-                                try std_out.print("{s}\n", .{path});
-                                return;
-                            }
-                        },
-                        .ident_ish, .other_stuff => {},
-                    }
-                }
-            },
-            .highlight => {
-                while (tokenizer.next()) |tok| {
-                    switch (tok.tag) {
-                        .camel, .adult_camel => {
-                            if (self.should_convert(tok.bytes)) {
-                                const color = if (tok.tag == .camel) "[31;4m" else "[33;4m";
-                                try std_out.writeByte(0o033);
-                                try std_out.writeAll(color);
-                                try convert_case(tok.bytes, std_out);
-                                try std_out.writeByte(0o033);
-                                try std_out.writeAll("[0m");
-                            } else {
-                                try std_out.writeAll(tok.bytes);
-                            }
-                        },
-                        .ident_ish, .other_stuff => {
-                            try std_out.writeAll(tok.bytes);
-                        },
-                    }
-                }
-            },
-            .convert => {
-                var will_change = false;
-                while (tokenizer.next()) |tok| {
-                    switch (tok.tag) {
-                        .camel, .adult_camel => {
-                            if (self.should_convert(tok.bytes)) {
-                                will_change = true;
-                                break;
-                            }
-                        },
-                        .ident_ish, .other_stuff => {},
-                    }
-                }
-                if (will_change) {
-                    tokenizer.reset();
-                    // TODO: modify file in place
+                if (self.file_will_change(src)) {
                     try std_out.print("{s}\n", .{path});
                 }
             },
+            .highlight => {
+                try self.write_with_changes(src, std_out, true);
+            },
+            .convert => {
+                if (self.file_will_change(src)) {
+                    const stat = try fs.cwd().statFile(path);
+                    var af = try fs.cwd().atomicFile(path, .{ .mode = stat.mode });
+                    defer af.deinit();
+
+                    try self.write_with_changes(src, af.file.writer(), false);
+                    try af.finish();
+                    try std_out.print("{s}\n", .{path});
+                }
+            },
+        }
+    }
+
+    fn file_will_change(self: *Converter, src: []const u8) bool {
+        var tokenizer = Tokenizer.init(src);
+        while (tokenizer.next()) |tok| {
+            switch (tok.tag) {
+                .camel, .adult_camel => {
+                    if (self.should_convert(tok.bytes)) {
+                        return true;
+                    }
+                },
+                .ident_ish, .other_stuff => {},
+            }
+        }
+        return false;
+    }
+
+    fn write_with_changes(self: *Converter, src: []const u8, writer: anytype, highlight: bool) !void {
+        var tokenizer = Tokenizer.init(src);
+        while (tokenizer.next()) |tok| {
+            switch (tok.tag) {
+                .camel, .adult_camel => {
+                    if (self.should_convert(tok.bytes)) {
+                        if (highlight) {
+                            const color = if (tok.tag == .camel) "[31;4m" else "[33;4m";
+                            try writer.writeByte(0o033);
+                            try writer.writeAll(color);
+                            try convert_case(tok.bytes, writer);
+                            try writer.writeByte(0o033);
+                            try writer.writeAll("[0m");
+                        } else {
+                            try convert_case(tok.bytes, writer);
+                        }
+                    } else {
+                        try writer.writeAll(tok.bytes);
+                    }
+                },
+                .ident_ish, .other_stuff => {
+                    try writer.writeAll(tok.bytes);
+                },
+            }
         }
     }
 
@@ -404,10 +416,6 @@ const Tokenizer = struct {
             .src = src,
             .index = 0,
         };
-    }
-
-    fn reset(self: *Tokenizer) void {
-        self.index = 0;
     }
 
     const State = enum {

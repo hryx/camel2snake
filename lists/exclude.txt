@@ -3,6 +3,7 @@ CMake
 WebAssembly
 MinGW
 macOS
+SPARCv9
 
 # CLI flags
 fPIC
@@ -13,3 +14,8 @@ fLLD
 
 # Plain English phrases
 CPUs
+
+# Units
+KiB
+MiB
+GiB
