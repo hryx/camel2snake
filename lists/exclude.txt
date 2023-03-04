@@ -1,0 +1,15 @@
+# Proper names
+CMake
+WebAssembly
+MinGW
+macOS
+
+# CLI flags
+fPIC
+fPIE
+fLLVM
+fClang
+fLLD
+
+# Plain English phrases
+CPUs

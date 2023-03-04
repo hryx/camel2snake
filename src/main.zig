@@ -28,11 +28,11 @@ fn usage() void {
         \\  -h, --help              Print this help and exit
         \\  --convert=IDENT         Convert instances of IDENT to snake case
         \\  --convert-list=FILE     Load newline-separated list of identifiers to convert from FILE
-        \\  --convert-all           Convert all identifiers except those explicitly excluded
+        \\  --convert-all           Convert identifiers by default, except those explicitly excluded
         \\  --except=IDENT          Do not convert instances of IDENT to snake case
-        \\  --except-list=FILE      Load newline-separated list of idenfifiers to ignore from FILE
+        \\  --except-list=FILE      Load newline-separated list of identifiers to ignore from FILE
         \\  --ignore-path=PATH      Do not process file or directory at PATH
-        \\  --adult-camels          Additionally convert AdultCamels into Adult_Snakes
+        \\  --adult-camels          If combined with --convert-all, additionally convert AdultCamels into Adult_Snakes
         \\  --dry-run               Print files that would have changes (does not modify files)
         \\  --dry-run-highlight     Print files, colorizing affected tokens (does not modify files)
         \\
@@ -83,17 +83,15 @@ pub fn main() !void {
             converter.adult_camels = true;
         } else if (mem.eql(u8, arg, "--convert-all")) {
             converter.convert_by_default = true;
-        } else if (get_flag_value(arg, "--convert=")) |name| {
+        } else if (get_flag_value(arg, "--convert")) |name| {
             try converter.convert_ident_set.put(converter.arena.allocator(), name, {});
-        } else if (get_flag_value(arg, "--convert-list=")) |path| {
-            _ = path;
-            @panic("TODO: load convert list from file");
-        } else if (get_flag_value(arg, "--except=")) |name| {
+        } else if (get_flag_value(arg, "--convert-list")) |path| {
+            try converter.load_conversion_list(path);
+        } else if (get_flag_value(arg, "--except")) |name| {
             try converter.ignore_ident_set.put(converter.arena.allocator(), name, {});
-        } else if (get_flag_value(arg, "--except-list=")) |path| {
-            _ = path;
-            @panic("TODO: load exclude list from file");
-        } else if (get_flag_value(arg, "--ignore-path=")) |path| {
+        } else if (get_flag_value(arg, "--except-list")) |path| {
+            try converter.load_exception_list(path);
+        } else if (get_flag_value(arg, "--ignore-path")) |path| {
             const abs_path = try fs.cwd().realpathAlloc(allocator, path);
             try converter.ignore_file_set.put(converter.arena.allocator(), abs_path, {});
         } else if (mem.startsWith(u8, arg, "-")) {
@@ -151,6 +149,67 @@ const Converter = struct {
         }
     }
 
+    pub fn load_conversion_list(self: *Converter, path: []const u8) !void {
+        const f = try fs.cwd().openFile(path, .{});
+        defer f.close();
+
+        var buf: [100]u8 = undefined;
+        while (try f.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
+            var iter = mem.split(u8, mem.trimLeft(u8, line, " "), " ");
+            const ident = iter.first();
+
+            if (ident.len == 0 or ident[0] == '#') {
+                continue;
+            }
+            if (!is_valid_identifier(ident)) {
+                log.err("invalid identifier {s} in conversion list file {s}", .{ ident, path });
+                continue;
+            }
+
+            const ident_copy = try self.arena.allocator().dupe(u8, ident);
+            if (iter.next()) |replacement| {
+                // TODO: Store optional replacement identifier
+                _ = replacement;
+            } else {
+                try self.convert_ident_set.put(self.arena.allocator(), ident_copy, {});
+            }
+        }
+    }
+
+    pub fn load_exception_list(self: *Converter, path: []const u8) !void {
+        const f = try fs.cwd().openFile(path, .{});
+        defer f.close();
+
+        var buf: [100]u8 = undefined;
+        while (try f.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
+            var iter = mem.split(u8, mem.trimLeft(u8, line, " "), " ");
+            const ident = iter.first();
+
+            if (ident.len == 0 or ident[0] == '#') {
+                continue;
+            }
+            if (!is_valid_identifier(ident)) {
+                log.err("invalid identifier {s} in exception list file {s}", .{ ident, path });
+                continue;
+            }
+
+            const ident_copy = try self.arena.allocator().dupe(u8, ident);
+            try self.ignore_ident_set.put(self.arena.allocator(), ident_copy, {});
+        }
+    }
+
+    fn is_valid_identifier(str: []const u8) bool {
+        assert(str.len > 0);
+        for (str, 0..) |c, i| {
+            switch (c) {
+                'A'...'Z', 'a'...'z', '_' => {},
+                '0'...'9' => if (i == 0) return false,
+                else => return false,
+            }
+        }
+        return true;
+    }
+
     fn scan_path(self: *Converter, dir: fs.Dir, path: []const u8) !void {
         const abs_path = try dir.realpathAlloc(self.arena.allocator(), path);
 
@@ -189,12 +248,8 @@ const Converter = struct {
             .dry_run => {
                 while (tokenizer.next()) |tok| {
                     switch (tok.tag) {
-                        .camel => {
-                            try std_out.print("{s}\n", .{path});
-                            return;
-                        },
-                        .adult_camel => {
-                            if (self.adult_camels) {
+                        .camel, .adult_camel => {
+                            if (self.should_convert(tok.bytes)) {
                                 try std_out.print("{s}\n", .{path});
                                 return;
                             }
@@ -206,17 +261,11 @@ const Converter = struct {
             .highlight => {
                 while (tokenizer.next()) |tok| {
                     switch (tok.tag) {
-                        .camel => {
-                            try std_out.writeByte(0o033);
-                            try std_out.writeAll("[31;4m");
-                            try convert_case(tok.bytes, std_out);
-                            try std_out.writeByte(0o033);
-                            try std_out.writeAll("[0m");
-                        },
-                        .adult_camel => {
-                            if (self.adult_camels) {
+                        .camel, .adult_camel => {
+                            if (self.should_convert(tok.bytes)) {
+                                const color = if (tok.tag == .camel) "[31;4m" else "[33;4m";
                                 try std_out.writeByte(0o033);
-                                try std_out.writeAll("[33;4m");
+                                try std_out.writeAll(color);
                                 try convert_case(tok.bytes, std_out);
                                 try std_out.writeByte(0o033);
                                 try std_out.writeAll("[0m");
@@ -231,35 +280,49 @@ const Converter = struct {
                 }
             },
             .convert => {
-                var changed = false;
+                var will_change = false;
                 while (tokenizer.next()) |tok| {
                     switch (tok.tag) {
-                        .camel => {
-                            log.info("TODO: convert ident {s}", .{tok.bytes});
-                            changed = true;
-                        },
-                        .adult_camel => {
-                            if (self.adult_camels) {
-                                log.info("TODO: convert ident {s}", .{tok.bytes});
-                                changed = true;
+                        .camel, .adult_camel => {
+                            if (self.should_convert(tok.bytes)) {
+                                will_change = true;
+                                break;
                             }
                         },
                         .ident_ish, .other_stuff => {},
                     }
                 }
-                if (changed) {
+                if (will_change) {
+                    tokenizer.reset();
+                    // TODO: modify file in place
                     try std_out.print("{s}\n", .{path});
                 }
             },
         }
     }
+
+    fn should_convert(self: *Converter, str: []const u8) bool {
+        if (self.ignore_ident_set.contains(str)) {
+            return false;
+        }
+        if (self.convert_ident_set.contains(str)) {
+            return true;
+        }
+        if (!self.convert_by_default) {
+            return false;
+        }
+        if (isUpper(str[0])) {
+            return self.adult_camels;
+        }
+        return true;
+    }
 };
 
-fn convert_case(token: []const u8, writer: anytype) !void {
-    const isUpper = std.ascii.isUpper;
-    const isLower = std.ascii.isLower;
-    const toLower = std.ascii.toLower;
+const isUpper = std.ascii.isUpper;
+const isLower = std.ascii.isLower;
+const toLower = std.ascii.toLower;
 
+fn convert_case(token: []const u8, writer: anytype) !void {
     assert(token.len > 0);
     try writer.writeByte(token[0]);
     if (token.len == 1) return;
@@ -341,6 +404,10 @@ const Tokenizer = struct {
             .src = src,
             .index = 0,
         };
+    }
+
+    fn reset(self: *Tokenizer) void {
+        self.index = 0;
     }
 
     const State = enum {
