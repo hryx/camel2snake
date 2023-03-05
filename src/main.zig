@@ -5,6 +5,7 @@ const log = std.log;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const OrderedStringSet = std.StringArrayHashMapUnmanaged(void);
 const StringSet = std.StringHashMapUnmanaged(void);
 const assert = std.debug.assert;
 
@@ -122,7 +123,7 @@ const Action = enum {
 const Converter = struct {
     arena: ArenaAllocator,
     ignore_file_set: StringSet,
-    to_convert_file_set: StringSet,
+    to_convert_file_set: OrderedStringSet,
     convert_ident_set: StringSet,
     ignore_ident_set: StringSet,
     convert_by_default: bool,
@@ -148,9 +149,8 @@ const Converter = struct {
         for (paths) |path| {
             try self.scan_path(fs.cwd(), path);
         }
-        var key_iter = self.to_convert_file_set.keyIterator();
-        while (key_iter.next()) |path| {
-            try self.process_file(path.*, action);
+        for (self.to_convert_file_set.keys()) |path| {
+            try self.process_file(path, action);
         }
     }
 
