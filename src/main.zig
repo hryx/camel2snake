@@ -420,7 +420,10 @@ const Tokenizer = struct {
 
     const State = enum {
         start,
+        number_ish,
         ident_ish,
+        backslash,
+        unicode_escape,
         other_stuff,
     };
 
@@ -451,9 +454,17 @@ const Tokenizer = struct {
                             lower_count = 1;
                         },
                         '_' => state = .ident_ish,
+                        '0'...'9' => state = .number_ish,
+                        '\\' => state = .backslash,
                         else => state = .other_stuff,
                     }
                     self.index += 1;
+                },
+                .number_ish => {
+                    switch (c) {
+                        'A'...'Z', 'a'...'z', '0'...'9', '_', '.' => self.index += 1,
+                        else => break,
+                    }
                 },
                 .ident_ish => {
                     switch (c) {
@@ -464,8 +475,32 @@ const Tokenizer = struct {
                     }
                     self.index += 1;
                 },
+                .backslash => switch (c) {
+                    'x' => {
+                        if (self.index + 2 < self.src.len) {
+                            self.index += 3;
+                        }
+                        break;
+                    },
+                    'u' => {
+                        state = .unicode_escape;
+                        self.index += 1;
+                    },
+                    else => {
+                        self.index += 1;
+                        break;
+                    },
+                },
+                .unicode_escape => switch (c) {
+                    '}' => {
+                        self.index += 1;
+                        break;
+                    },
+                    else => self.index += 1,
+                },
                 .other_stuff => switch (c) {
-                    'A'...'Z', 'a'...'z', '_' => break,
+                    'A'...'Z', 'a'...'z', '0'...'9', '_' => break,
+                    '\\' => break,
                     else => self.index += 1,
                 },
             }
@@ -480,19 +515,28 @@ const Tokenizer = struct {
                     return Token{ .bytes = bytes, .tag = .camel };
                 return Token{ .bytes = bytes, .tag = .ident_ish };
             },
-            .other_stuff => return Token{ .bytes = bytes, .tag = .other_stuff },
+            .other_stuff,
+            .number_ish,
+            .backslash,
+            .unicode_escape,
+            => return Token{ .bytes = bytes, .tag = .other_stuff },
         }
     }
 };
 
 test "tokenize" {
     try testTokenize(
-        \\ [] {} 1234 fn
+        \\ [] {} 0x888.f000 :0x12Ab34Cd fn
         \\   babbyFunc.ComplexPappy,x_qwfpgjl
-        \\%SixtyFour();
+        \\%SixtyFour5();
+        \\ \u{Ab02}\xFF
     ,
         &.{
-            .{ .tag = .other_stuff, .bytes = " [] {} 1234 " },
+            .{ .tag = .other_stuff, .bytes = " [] {} " },
+            .{ .tag = .other_stuff, .bytes = "0x888.f000" },
+            .{ .tag = .other_stuff, .bytes = " :" },
+            .{ .tag = .other_stuff, .bytes = "0x12Ab34Cd" },
+            .{ .tag = .other_stuff, .bytes = " " },
             .{ .tag = .ident_ish, .bytes = "fn" },
             .{ .tag = .other_stuff, .bytes = "\n   " },
             .{ .tag = .camel, .bytes = "babbyFunc" },
@@ -501,8 +545,10 @@ test "tokenize" {
             .{ .tag = .other_stuff, .bytes = "," },
             .{ .tag = .ident_ish, .bytes = "x_qwfpgjl" },
             .{ .tag = .other_stuff, .bytes = "\n%" },
-            .{ .tag = .adult_camel, .bytes = "SixtyFour" },
-            .{ .tag = .other_stuff, .bytes = "();" },
+            .{ .tag = .adult_camel, .bytes = "SixtyFour5" },
+            .{ .tag = .other_stuff, .bytes = "();\n " },
+            .{ .tag = .other_stuff, .bytes = "\\u{Ab02}" },
+            .{ .tag = .other_stuff, .bytes = "\\xFF" },
         },
     );
 }
