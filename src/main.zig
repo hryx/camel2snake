@@ -5,8 +5,6 @@ const log = std.log;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const OrderedStringSet = std.StringArrayHashMapUnmanaged(void);
-const StringSet = std.StringHashMapUnmanaged(void);
 const assert = std.debug.assert;
 
 fn usage() void {
@@ -27,7 +25,7 @@ fn usage() void {
         \\Options:
         \\
         \\  -h, --help              Print this help and exit
-        \\  --convert=IDENT         Convert instances of IDENT to snake case
+        \\  --convert=IDENT[=SUB]   Convert instances of IDENT to snake case, replacing with SUB or using default strategy
         \\  --convert-list=FILE     Load newline-separated list of identifiers to convert from FILE
         \\  --convert-all           Convert identifiers by default, except those explicitly excluded
         \\  --except=IDENT          Do not convert instances of IDENT to snake case
@@ -45,6 +43,12 @@ fn get_flag_value(arg: []const u8, flag: [:0]const u8) ?[]const u8 {
     var iter = mem.split(u8, arg, "=");
     if (mem.eql(u8, iter.first(), flag)) return iter.rest();
     return null;
+}
+
+fn get_kv_val(kv: []const u8) ?[]const u8 {
+    var iter = mem.split(u8, kv, "=");
+    _ = iter.first();
+    return iter.rest();
 }
 
 pub fn main() !void {
@@ -86,11 +90,12 @@ pub fn main() !void {
         } else if (mem.eql(u8, arg, "--convert-all")) {
             converter.convert_by_default = true;
         } else if (get_flag_value(arg, "--convert")) |name| {
-            try converter.convert_ident_set.put(converter.arena.allocator(), name, {});
+            const rep = get_kv_val(name); // Optional explicit replacement value
+            _ = try converter.register_replacement(name, rep);
         } else if (get_flag_value(arg, "--convert-list")) |path| {
             try converter.load_conversion_list(path);
         } else if (get_flag_value(arg, "--except")) |name| {
-            try converter.ignore_ident_set.put(converter.arena.allocator(), name, {});
+            try converter.register_exclusion(name);
         } else if (get_flag_value(arg, "--except-list")) |path| {
             try converter.load_exception_list(path);
         } else if (get_flag_value(arg, "--ignore-path")) |path| {
@@ -122,10 +127,12 @@ const Action = enum {
 
 const Converter = struct {
     arena: ArenaAllocator,
-    ignore_file_set: StringSet,
-    to_convert_file_set: OrderedStringSet,
-    convert_ident_set: StringSet,
-    ignore_ident_set: StringSet,
+    ignore_file_set: std.StringHashMapUnmanaged(void),
+    to_convert_file_set: std.StringArrayHashMapUnmanaged(void),
+    /// Stores both explicit conversions and cached previous conversions.
+    convert_ident_map: std.StringHashMapUnmanaged([]const u8),
+    /// Tokens explicitly disallowed from conversion.
+    ignore_ident_set: std.StringHashMapUnmanaged(void),
     convert_by_default: bool,
     adult_camels: bool,
 
@@ -134,7 +141,7 @@ const Converter = struct {
             .arena = ArenaAllocator.init(allocator),
             .ignore_file_set = .{},
             .to_convert_file_set = .{},
-            .convert_ident_set = .{},
+            .convert_ident_map = .{},
             .ignore_ident_set = .{},
             .convert_by_default = false,
             .adult_camels = false,
@@ -154,16 +161,25 @@ const Converter = struct {
         }
     }
 
+    /// Register explicit replacements from a file.
+    /// File has this format:
+    ///
+    /// # comment
+    /// myFunc
+    /// ThisOneToo # other comment
+    ///
+    /// # blank lines are ok
+    /// otherFunc optional_explicit_replacement
     pub fn load_conversion_list(self: *Converter, path: []const u8) !void {
         const f = try fs.cwd().openFile(path, .{});
         defer f.close();
 
-        var buf: [100]u8 = undefined;
-        while (try f.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
-            var iter = mem.split(u8, mem.trimLeft(u8, line, " "), " ");
-            const ident = iter.first();
+        var line_buf: [200]u8 = undefined;
+        while (try f.reader().readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
+            var iter = mem.tokenize(u8, line, " ");
+            const ident = iter.next() orelse break;
 
-            if (ident.len == 0 or ident[0] == '#') {
+            if (ident[0] == '#') {
                 continue;
             }
             if (!is_valid_identifier(ident)) {
@@ -171,13 +187,16 @@ const Converter = struct {
                 continue;
             }
 
-            const ident_copy = try self.arena.allocator().dupe(u8, ident);
-            if (iter.next()) |replacement| {
-                // TODO: Store optional replacement identifier
-                _ = replacement;
-            } else {
-                try self.convert_ident_set.put(self.arena.allocator(), ident_copy, {});
+            var replacement: ?[]const u8 = null;
+            if (iter.next()) |str| b: {
+                if (str[0] == '#') break :b;
+                if (mem.eql(u8, str, ident)) {
+                    replacement = ident;
+                } else {
+                    replacement = try self.arena.allocator().dupe(u8, str);
+                }
             }
+            _ = try self.register_replacement(ident, replacement);
         }
     }
 
@@ -185,12 +204,12 @@ const Converter = struct {
         const f = try fs.cwd().openFile(path, .{});
         defer f.close();
 
-        var buf: [100]u8 = undefined;
-        while (try f.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
-            var iter = mem.split(u8, mem.trimLeft(u8, line, " "), " ");
-            const ident = iter.first();
+        var line_buf: [200]u8 = undefined;
+        while (try f.reader().readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
+            var iter = mem.tokenize(u8, line, " ");
+            const ident = iter.next() orelse return;
 
-            if (ident.len == 0 or ident[0] == '#') {
+            if (ident[0] == '#') {
                 continue;
             }
             if (!is_valid_identifier(ident)) {
@@ -198,8 +217,7 @@ const Converter = struct {
                 continue;
             }
 
-            const ident_copy = try self.arena.allocator().dupe(u8, ident);
-            try self.ignore_ident_set.put(self.arena.allocator(), ident_copy, {});
+            try self.register_exclusion(ident);
         }
     }
 
@@ -276,12 +294,8 @@ const Converter = struct {
         while (tokenizer.next()) |tok| {
             switch (tok.tag) {
                 .camel, .adult_camel => {
-                    if (self.should_convert(tok.bytes)) {
-                        var buf: [200]u8 = undefined;
-                        var fbs = std.io.fixedBufferStream(&buf);
-                        try convert_case(tok.bytes, fbs.writer());
-                        const changed = !mem.eql(u8, fbs.getWritten(), tok.bytes);
-                        if (changed) return true;
+                    if (try self.get_replacement(tok.bytes) != null) {
+                        return true;
                     }
                 },
                 .ident_ish, .other_stuff => {},
@@ -295,25 +309,16 @@ const Converter = struct {
         while (tokenizer.next()) |tok| {
             switch (tok.tag) {
                 .camel, .adult_camel => {
-                    if (self.should_convert(tok.bytes)) {
+                    if (try self.get_replacement(tok.bytes)) |rep| {
                         if (highlight) {
-                            var buf: [200]u8 = undefined;
-                            var fbs = std.io.fixedBufferStream(&buf);
-                            try convert_case(tok.bytes, fbs.writer());
-
-                            const changed = !mem.eql(u8, fbs.getWritten(), tok.bytes);
-                            if (changed) {
-                                const color = if (tok.tag == .camel) "[31;4m" else "[33;4m";
-                                try writer.writeByte(0o033);
-                                try writer.writeAll(color);
-                            }
-                            try writer.writeAll(fbs.getWritten());
-                            if (changed) {
-                                try writer.writeByte(0o033);
-                                try writer.writeAll("[0m");
-                            }
+                            const color = if (tok.tag == .camel) "[31;4m" else "[33;4m";
+                            try writer.writeByte(0o033);
+                            try writer.writeAll(color);
+                            try writer.writeAll(rep);
+                            try writer.writeByte(0o033);
+                            try writer.writeAll("[0m");
                         } else {
-                            try convert_case(tok.bytes, writer);
+                            try writer.writeAll(rep);
                         }
                     } else {
                         try writer.writeAll(tok.bytes);
@@ -326,20 +331,68 @@ const Converter = struct {
         }
     }
 
-    fn should_convert(self: *Converter, str: []const u8) bool {
-        if (self.ignore_ident_set.contains(str)) {
-            return false;
+    /// Returns null if the token should not be replaced.
+    fn get_replacement(self: *Converter, token: []const u8) !?[]const u8 {
+        if (self.ignore_ident_set.contains(token)) {
+            return null;
         }
-        if (self.convert_ident_set.contains(str)) {
-            return true;
+        if (self.convert_ident_map.get(token)) |val| {
+            return val;
         }
         if (!self.convert_by_default) {
-            return false;
+            return null;
         }
-        if (isUpper(str[0])) {
-            return self.adult_camels;
+        if (isUpper(token[0])) {
+            if (self.adult_camels) {
+                return try self.register_replacement(token, null);
+            }
+            return null;
         }
-        return true;
+        return try self.register_replacement(token, null);
+    }
+
+    /// Register a new token replacement and return it.
+    /// If the replacement is the same as the original token,
+    /// registers an exclusion instead and returns null.
+    /// If `replacement` is null, creates a new one using the default replacement strategy.
+    /// Makes a copy of `token` and `replacement` (if present).
+    /// Asserts the token has not already been registered.
+    fn register_replacement(
+        self: *Converter,
+        token: []const u8,
+        replacement: ?[]const u8,
+    ) !?[]const u8 {
+        assert(!self.convert_ident_map.contains(token));
+
+        if (replacement) |rep| {
+            if (mem.eql(u8, token, rep)) {
+                try self.register_exclusion(token);
+                return null;
+            }
+            const token_copy = try self.arena.allocator().dupe(u8, token);
+            try self.convert_ident_map.put(self.arena.allocator(), token_copy, rep);
+            return rep;
+        }
+
+        var buf: [200]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try convert_case(token, fbs.writer());
+        const rep = fbs.getWritten();
+
+        if (mem.eql(u8, token, rep)) {
+            try self.register_exclusion(token);
+            return null;
+        }
+
+        const token_copy = try self.arena.allocator().dupe(u8, token);
+        const rep_copy = try self.arena.allocator().dupe(u8, rep);
+        try self.convert_ident_map.put(self.arena.allocator(), token_copy, rep_copy);
+        return rep_copy;
+    }
+
+    fn register_exclusion(self: *Converter, token: []const u8) !void {
+        const token_copy = try self.arena.allocator().dupe(u8, token);
+        try self.ignore_ident_set.put(self.arena.allocator(), token_copy, {});
     }
 };
 
