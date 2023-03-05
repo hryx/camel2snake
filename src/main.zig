@@ -250,7 +250,7 @@ const Converter = struct {
         const std_out = std.io.getStdOut().writer();
         switch (action) {
             .dry_run => {
-                if (self.file_will_change(src)) {
+                if (try self.file_will_change(src)) {
                     try std_out.print("{s}\n", .{path});
                 }
             },
@@ -258,7 +258,7 @@ const Converter = struct {
                 try self.write_with_changes(src, std_out, true);
             },
             .convert => {
-                if (self.file_will_change(src)) {
+                if (try self.file_will_change(src)) {
                     const stat = try fs.cwd().statFile(path);
                     var af = try fs.cwd().atomicFile(path, .{ .mode = stat.mode });
                     defer af.deinit();
@@ -271,13 +271,17 @@ const Converter = struct {
         }
     }
 
-    fn file_will_change(self: *Converter, src: []const u8) bool {
+    fn file_will_change(self: *Converter, src: []const u8) !bool {
         var tokenizer = Tokenizer.init(src);
         while (tokenizer.next()) |tok| {
             switch (tok.tag) {
                 .camel, .adult_camel => {
                     if (self.should_convert(tok.bytes)) {
-                        return true;
+                        var buf: [200]u8 = undefined;
+                        var fbs = std.io.fixedBufferStream(&buf);
+                        try convert_case(tok.bytes, fbs.writer());
+                        const changed = !mem.eql(u8, fbs.getWritten(), tok.bytes);
+                        if (changed) return true;
                     }
                 },
                 .ident_ish, .other_stuff => {},
@@ -293,12 +297,21 @@ const Converter = struct {
                 .camel, .adult_camel => {
                     if (self.should_convert(tok.bytes)) {
                         if (highlight) {
-                            const color = if (tok.tag == .camel) "[31;4m" else "[33;4m";
-                            try writer.writeByte(0o033);
-                            try writer.writeAll(color);
-                            try convert_case(tok.bytes, writer);
-                            try writer.writeByte(0o033);
-                            try writer.writeAll("[0m");
+                            var buf: [200]u8 = undefined;
+                            var fbs = std.io.fixedBufferStream(&buf);
+                            try convert_case(tok.bytes, fbs.writer());
+
+                            const changed = !mem.eql(u8, fbs.getWritten(), tok.bytes);
+                            if (changed) {
+                                const color = if (tok.tag == .camel) "[31;4m" else "[33;4m";
+                                try writer.writeByte(0o033);
+                                try writer.writeAll(color);
+                            }
+                            try writer.writeAll(fbs.getWritten());
+                            if (changed) {
+                                try writer.writeByte(0o033);
+                                try writer.writeAll("[0m");
+                            }
                         } else {
                             try convert_case(tok.bytes, writer);
                         }
