@@ -311,7 +311,7 @@ const Converter = struct {
                 .camel, .adult_camel => {
                     if (try self.get_replacement(tok.bytes)) |rep| {
                         if (highlight) {
-                            const color = if (tok.tag == .camel) "[31;4m" else "[33;4m";
+                            const color = if (tok.tag == .camel) "[31m" else "[33m";
                             try writer.writeByte(0o033);
                             try writer.writeAll(color);
                             try writer.writeAll(rep);
