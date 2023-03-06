@@ -37,6 +37,7 @@ fn usage() void {
         \\  --adult-camels          If combined with --convert-all, additionally convert AdultCamels into Adult_Snakes
         \\  --dry-run               Print files that would have changes (does not modify files)
         \\  --dry-run-highlight     Print files, colorizing affected tokens (does not modify files)
+        \\  --max-file-kb=SIZE      Maximum file size in kilobytes (default 10000)
         \\
     ;
     std.io.getStdErr().writeAll(text) catch unreachable;
@@ -143,6 +144,7 @@ pub fn main() !void {
     defer converter.deinit();
 
     var action: Converter.Action = .convert;
+    var max_file_size: u32 = 10_000_000;
     var no_more_options = false;
     for (args[1..]) |arg| {
         if (no_more_options) {
@@ -197,8 +199,18 @@ pub fn main() !void {
                 },
             }
         } else if (get_flag_value(arg, "--ignore-path")) |path| {
-            const abs_path = try fs.cwd().realpathAlloc(allocator, path);
+            const abs_path = fs.cwd().realpathAlloc(converter.arena.allocator(), path) catch |err| {
+                switch (err) {
+                    error.FileNotFound => {
+                        log.warn("{s}: file does not exist, skipping", .{arg});
+                        continue;
+                    },
+                    else => return err,
+                }
+            };
             try converter.ignore_file_set.put(converter.arena.allocator(), abs_path, {});
+        } else if (get_flag_value(arg, "--max-file-kb")) |val| {
+            max_file_size = try std.fmt.parseUnsigned(u32, val, 10) * 1000;
         } else if (mem.startsWith(u8, arg, "-")) {
             log.err("unrecognized option: {s}", .{arg});
             usage();
@@ -214,7 +226,14 @@ pub fn main() !void {
         os.exit(1);
     }
 
-    try converter.process_files(paths.items, action);
+    converter.process_files(paths.items, action, max_file_size) catch |err| {
+        log.err("last file in progess: {s}", .{converter.last_file_in_progress});
+        switch (err) {
+            error.FileTooBig => log.err("file was too big, consider using --max-file-kb", .{}),
+            else => {},
+        }
+        return err;
+    };
 }
 
 const Converter = struct {
@@ -232,6 +251,8 @@ const Converter = struct {
     wildcard_rules: std.ArrayListUnmanaged(Wildcard),
     convert_by_default: bool,
     adult_camels: bool,
+    /// Record path of file being checked so caller can report errors.
+    last_file_in_progress: []const u8,
 
     const Action = enum {
         dry_run,
@@ -256,6 +277,7 @@ const Converter = struct {
             .wildcard_rules = .{},
             .convert_by_default = false,
             .adult_camels = false,
+            .last_file_in_progress = "",
         };
     }
 
@@ -263,12 +285,17 @@ const Converter = struct {
         self.arena.deinit();
     }
 
-    pub fn process_files(self: *Converter, paths: []const []const u8, action: Action) !void {
+    pub fn process_files(
+        self: *Converter,
+        paths: []const []const u8,
+        action: Action,
+        max_file_size: u32,
+    ) !void {
         for (paths) |path| {
             try self.scan_path(fs.cwd(), path);
         }
         for (self.to_convert_file_set.keys()) |path| {
-            try self.process_file(path, action);
+            try self.process_file(path, action, max_file_size);
         }
     }
 
@@ -299,6 +326,8 @@ const Converter = struct {
     }
 
     fn scan_path(self: *Converter, dir: fs.Dir, path: []const u8) !void {
+        self.last_file_in_progress = path;
+
         const abs_path = try dir.realpathAlloc(self.arena.allocator(), path);
 
         if (self.ignore_file_set.contains(abs_path)) {
@@ -325,9 +354,16 @@ const Converter = struct {
         }
     }
 
-    fn process_file(self: *Converter, path: []const u8, action: Action) !void {
+    fn process_file(
+        self: *Converter,
+        path: []const u8,
+        action: Action,
+        max_file_size: u32,
+    ) !void {
+        self.last_file_in_progress = path;
+
         const allocator = self.arena.child_allocator;
-        const src = try fs.cwd().readFileAlloc(allocator, path, 10_000_000);
+        const src = try fs.cwd().readFileAlloc(allocator, path, max_file_size);
         defer allocator.free(src);
 
         const std_out = std.io.getStdOut().writer();
