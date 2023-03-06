@@ -251,6 +251,10 @@ pub fn main() !void {
             std_err.print("    Lower: {}\n", .{converter.babbies_changed}) catch {};
             std_err.print("    Upper: {}\n", .{converter.pappies_changed}) catch {};
             std_err.print("    Total: {}\n", .{converter.babbies_changed + converter.pappies_changed}) catch {};
+            std_err.print("  Unique camel case tokens registered:\n", .{}) catch {};
+            std_err.print("    Converted: {}\n", .{converter.unique_replacements}) catch {};
+            std_err.print("    Excluded or canonical: {}\n", .{converter.unique_exclusions}) catch {};
+            std_err.print("    Total: {}\n", .{converter.unique_replacements + converter.unique_exclusions}) catch {};
         }
     }
 
@@ -286,6 +290,8 @@ const Converter = struct {
     babbies_changed: u32 = 0,
     pappies_found: u32 = 0,
     pappies_changed: u32 = 0,
+    unique_exclusions: u32 = 0,
+    unique_replacements: u32 = 0,
     files_changed: u32 = 0,
 
     const Action = enum {
@@ -554,6 +560,7 @@ const Converter = struct {
                 try self.register_exclusion(token);
                 return null;
             }
+            self.unique_replacements += 1;
             const token_copy = try self.arena.allocator().dupe(u8, token);
             try self.convert_ident_map.put(self.arena.allocator(), token_copy, rep);
             return rep;
@@ -569,6 +576,7 @@ const Converter = struct {
             return null;
         }
 
+        self.unique_replacements += 1;
         const token_copy = try self.arena.allocator().dupe(u8, token);
         const rep_copy = try self.arena.allocator().dupe(u8, rep);
         try self.convert_ident_map.put(self.arena.allocator(), token_copy, rep_copy);
@@ -578,6 +586,7 @@ const Converter = struct {
     /// Makes a copy of `token`.
     fn register_exclusion(self: *Converter, token: []const u8) !void {
         if (!std.zig.isValidId(token)) return error.InvalidIdentifier;
+        self.unique_exclusions += 1;
         const token_copy = try self.arena.allocator().dupe(u8, token);
         try self.ignore_ident_set.put(self.arena.allocator(), token_copy, {});
     }
