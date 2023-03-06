@@ -369,7 +369,9 @@ const Converter = struct {
         return false;
     }
 
-    fn write_with_changes(self: *Converter, src: []const u8, writer: anytype, highlight: bool) !void {
+    fn write_with_changes(self: *Converter, src: []const u8, w: anytype, highlight: bool) !void {
+        var bw = std.io.bufferedWriter(w);
+        const writer = bw.writer();
         var tokenizer = Tokenizer.init(src);
         while (tokenizer.next()) |tok| {
             switch (tok.tag) {
@@ -394,6 +396,7 @@ const Converter = struct {
                 },
             }
         }
+        try bw.flush();
     }
 
     /// Returns null if the token should not be replaced.
