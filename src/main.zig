@@ -38,6 +38,7 @@ fn usage() void {
         \\  --dry-run               Print files that would have changes (does not modify files)
         \\  --dry-run-highlight     Print files, colorizing affected tokens (does not modify files)
         \\  --max-file-kb=SIZE      Maximum file size in kilobytes (default 10000)
+        \\  --stats                 When finished, print some information about changes to stderr
         \\
     ;
     std.io.getStdErr().writeAll(text) catch unreachable;
@@ -145,6 +146,7 @@ pub fn main() !void {
 
     var action: Converter.Action = .convert;
     var max_file_size: u32 = 10_000_000;
+    var print_stats = false;
     var no_more_options = false;
     for (args[1..]) |arg| {
         if (no_more_options) {
@@ -211,6 +213,8 @@ pub fn main() !void {
             try converter.ignore_file_set.put(converter.arena.allocator(), abs_path, {});
         } else if (get_flag_value(arg, "--max-file-kb")) |val| {
             max_file_size = try std.fmt.parseUnsigned(u32, val, 10) * 1000;
+        } else if (mem.eql(u8, arg, "--stats")) {
+            print_stats = true;
         } else if (mem.startsWith(u8, arg, "-")) {
             log.err("unrecognized option: {s}", .{arg});
             usage();
@@ -224,6 +228,30 @@ pub fn main() !void {
         log.err("no files or directories specified", .{});
         usage();
         os.exit(1);
+    }
+
+    var timer = try std.time.Timer.start();
+    const start_time = timer.read();
+
+    defer {
+        const end_time = timer.lap();
+        const time_diff = end_time - start_time;
+        const seconds = @intToFloat(f64, time_diff) / std.time.ns_per_s;
+        if (print_stats) {
+            const std_err = std.io.getStdErr().writer();
+            std_err.print("Summary of changes:\n", .{}) catch {};
+            std_err.print("  Time taken: {d:.5} seconds\n", .{seconds}) catch {};
+            std_err.print("  Files found: {}\n", .{converter.to_convert_file_set.count()}) catch {};
+            std_err.print("  Files changed: {}\n", .{converter.files_changed}) catch {};
+            std_err.print("  Camel case tokens found:\n", .{}) catch {};
+            std_err.print("    Lower: {}\n", .{converter.babbies_found}) catch {};
+            std_err.print("    Upper: {}\n", .{converter.pappies_found}) catch {};
+            std_err.print("    Total: {}\n", .{converter.babbies_found + converter.pappies_found}) catch {};
+            std_err.print("  Camel case tokens changed:\n", .{}) catch {};
+            std_err.print("    Lower: {}\n", .{converter.babbies_changed}) catch {};
+            std_err.print("    Upper: {}\n", .{converter.pappies_changed}) catch {};
+            std_err.print("    Total: {}\n", .{converter.babbies_changed + converter.pappies_changed}) catch {};
+        }
     }
 
     converter.process_files(paths.items, action, max_file_size) catch |err| {
@@ -253,6 +281,12 @@ const Converter = struct {
     adult_camels: bool,
     /// Record path of file being checked so caller can report errors.
     last_file_in_progress: []const u8,
+
+    babbies_found: u32 = 0,
+    babbies_changed: u32 = 0,
+    pappies_found: u32 = 0,
+    pappies_changed: u32 = 0,
+    files_changed: u32 = 0,
 
     const Action = enum {
         dry_run,
@@ -367,42 +401,51 @@ const Converter = struct {
         defer allocator.free(src);
 
         const std_out = std.io.getStdOut().writer();
+        if (!try self.file_will_change(src)) return;
+        self.files_changed += 1;
+
         switch (action) {
             .dry_run => {
-                if (try self.file_will_change(src)) {
-                    try std_out.print("{s}\n", .{path});
-                }
+                try std_out.print("{s}\n", .{path});
             },
             .highlight => {
                 try self.write_with_changes(src, std_out, true);
             },
             .convert => {
-                if (try self.file_will_change(src)) {
-                    const stat = try fs.cwd().statFile(path);
-                    var af = try fs.cwd().atomicFile(path, .{ .mode = stat.mode });
-                    defer af.deinit();
+                const stat = try fs.cwd().statFile(path);
+                var af = try fs.cwd().atomicFile(path, .{ .mode = stat.mode });
+                defer af.deinit();
 
-                    try self.write_with_changes(src, af.file.writer(), false);
-                    try af.finish();
-                    try std_out.print("{s}\n", .{path});
-                }
+                try self.write_with_changes(src, af.file.writer(), false);
+                try af.finish();
+                try std_out.print("{s}\n", .{path});
             },
         }
     }
 
     fn file_will_change(self: *Converter, src: []const u8) !bool {
         var tokenizer = Tokenizer.init(src);
+        var changed = false;
         while (tokenizer.next()) |tok| {
             switch (tok.tag) {
-                .camel, .adult_camel => {
+                .camel => {
+                    self.babbies_found += 1;
                     if (try self.get_replacement(tok.bytes) != null) {
-                        return true;
+                        self.babbies_changed += 1;
+                        changed = true;
+                    }
+                },
+                .adult_camel => {
+                    self.pappies_found += 1;
+                    if (try self.get_replacement(tok.bytes) != null) {
+                        self.pappies_changed += @boolToInt(self.adult_camels);
+                        changed = true;
                     }
                 },
                 .ident_ish, .other_stuff => {},
             }
         }
-        return false;
+        return changed;
     }
 
     fn write_with_changes(self: *Converter, src: []const u8, w: anytype, highlight: bool) !void {
