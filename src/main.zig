@@ -168,10 +168,13 @@ pub fn main() !void {
         } else if (get_flag_value(arg, "--convert")) |kv| {
             var iter = mem.split(u8, kv, "=");
             const name = iter.first();
-            const rep = iter.rest(); // Optional replacement token
+            const rep = iter.next(); // Optional replacement token
             _ = converter.register_replacement(name, rep) catch |err| switch (err) {
                 error.InvalidIdentifier => {
-                    log.err("invalid identifier in --convert: {s} = {s}", .{ name, rep });
+                    log.err("invalid identifier in --convert: {s} = {s}", .{
+                        name,
+                        if (rep) |r| r else "(default)",
+                    });
                     os.exit(1);
                 },
                 else => return err,
