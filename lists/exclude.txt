@@ -3,7 +3,30 @@
 !WebAssembly
 !MinGW
 !macOS
-!SPARCv9
+!CentOS
+!OpenELEC
+!openSUSE
+!OpenBSD
+!FreeBSD
+SPARCv9 SPARC_v9
+!PowerPC
+!PowerPC64
+
+# Cryptographic
+!ChaCha*
+!XChaCha*
+!Poly1305
+!ed25519
+!Ed25519
+!EdDSA
+!GHash
+!X509*
+
+# LLVM names
+!AArch64
+!DumpCode
+!SystemZ
+!XCore
 
 # CLI flags
 !fPIC
@@ -14,6 +37,8 @@
 
 # Plain English phrases
 !CPUs
+!ASICs
+!XORed
 
 # Units
 !KiB
