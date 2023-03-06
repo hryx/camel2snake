@@ -1,21 +1,21 @@
 # Proper names
-CMake
-WebAssembly
-MinGW
-macOS
-SPARCv9
+!CMake
+!WebAssembly
+!MinGW
+!macOS
+!SPARCv9
 
 # CLI flags
-fPIC
-fPIE
-fLLVM
-fClang
-fLLD
+!fPIC
+!fPIE
+!fLLVM
+!fClang
+!fLLD
 
 # Plain English phrases
-CPUs
+!CPUs
 
 # Units
-KiB
-MiB
-GiB
+!KiB
+!MiB
+!GiB

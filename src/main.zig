@@ -6,6 +6,9 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const assert = std.debug.assert;
+const testing = std.testing;
+
+const Rule = @import("Rule.zig");
 
 fn usage() void {
     const text =
@@ -25,11 +28,11 @@ fn usage() void {
         \\Options:
         \\
         \\  -h, --help              Print this help and exit
-        \\  --convert=IDENT[=SUB]   Convert instances of IDENT to snake case, replacing with SUB or using default strategy
-        \\  --convert-list=FILE     Load newline-separated list of identifiers to convert from FILE
+        \\  --help-rules            Print help for identifier matching and replacement rules and exit
         \\  --convert-all           Convert identifiers by default, except those explicitly excluded
+        \\  --convert=IDENT[=SUB]   Convert instances of IDENT to snake case, replacing with SUB or using default strategy
         \\  --except=IDENT          Do not convert instances of IDENT to snake case
-        \\  --except-list=FILE      Load newline-separated list of identifiers to ignore from FILE
+        \\  --load-rules=FILE       Load matching rules from FILE
         \\  --ignore-path=PATH      Do not process file or directory at PATH
         \\  --adult-camels          If combined with --convert-all, additionally convert AdultCamels into Adult_Snakes
         \\  --dry-run               Print files that would have changes (does not modify files)
@@ -39,16 +42,86 @@ fn usage() void {
     std.io.getStdErr().writeAll(text) catch unreachable;
 }
 
+fn rule_help() void {
+    const text =
+        \\camel2snake identifier matching and replacement rules
+        \\
+        \\camel2snake identifies all camel case tokens in files it reads,
+        \\but by default, it will leave them all unchanged. Beavhior can
+        \\be changed either by specifying individual patterns as
+        \\command-line options or by pointing to files containing rules.
+        \\
+        \\Any of the options mentioned below can be specified multiple times.
+        \\In all cases, tokens must be valid C/Zig identifiers, i.e. they
+        \\must match the regular expression:
+        \\
+        \\    [A-Za-z_][A-Za-z0-9_]*
+        \\
+        \\The simplest option is --convert-all, which changes the baseline
+        \\behavior from ignoring camel case tokens to replacing them with
+        \\snake case equivalents. In other words, this changes the baseline
+        \\behavior from opt-in to opt-out. Further options can add exceptions
+        \\(tokens to explicitly ignore) or explicit substitution tokens.
+        \\
+        \\The --except=IDENT option ensures that tokens matching IDENT exactly
+        \\will not be altered, even if other options have enabled token
+        \\conversion. Explicit exclusions have the highest precedence.
+        \\
+        \\The --convert=IDENT option specifies a token which should be replaced
+        \\using the default camel case -> snake case conversion algorithm.
+        \\The form --convert=IDENT=SUB will replace all instances of the token
+        \\IDENT with exact value SUB. This can be used for individual overrides
+        \\when the default conversion strategy produces undesirable output.
+        \\
+        \\For anything more complicated, use the --load-rules=FILE option.
+        \\The file at path FILE is a plain text file with syntax and behavior
+        \\described by the following example.
+        \\
+        \\    # Comments and blank line are ignored.
+        \\    # Comments may appear on their own on the same line as a rule.
+        \\
+        \\    # Replace all instances of a token with the default strategy.
+        \\    myThing
+        \\
+        \\    # Replace all instances of a token with an explicit value.
+        \\    myAPIthing my_api_thing
+        \\
+        \\    # Ignore all instances of a token.
+        \\    # Only the first character may be a '!'.
+        \\    !MOVcc # name of opcode
+        \\    !macOS # brand name
+        \\
+        \\    # Wildcards may be used to match all tokens with a certain prefix.
+        \\    # Only the last character may be a '*'.
+        \\    # Wildcards can only use the default replacement strategy,
+        \\    # not explicit replacements.
+        \\    HttpError*
+        \\
+        \\    # Wildcards can also be used in exclusion rules.
+        \\    !GLFW*
+        \\    !SDL_*
+        \\
+        \\Wildcards have the lowest precedence; tokens are compared for exact
+        \\matches before being checked against wildcard matches. If both a
+        \\replacement and exclusion rule for the same wildcard pattern is found,
+        \\the program returns an error.
+        \\
+        \\By default, camel case tokens that start with a capital letter are
+        \\ignored. Use --adult-camels *in addition to* --convert-all to match
+        \\and convert them as well. This option is not required to match or replace
+        \\such tokens if they match an explicit rule as decribed above.
+        \\
+        \\When in doubt, use the --dry-run-highlight flag to preview the changes
+        \\that would take effect with any combination of rules and options.
+        \\
+    ;
+    std.io.getStdErr().writeAll(text) catch unreachable;
+}
+
 fn get_flag_value(arg: []const u8, flag: [:0]const u8) ?[]const u8 {
     var iter = mem.split(u8, arg, "=");
     if (mem.eql(u8, iter.first(), flag)) return iter.rest();
     return null;
-}
-
-fn get_kv_val(kv: []const u8) ?[]const u8 {
-    var iter = mem.split(u8, kv, "=");
-    _ = iter.first();
-    return iter.rest();
 }
 
 pub fn main() !void {
@@ -69,7 +142,7 @@ pub fn main() !void {
     var converter = Converter.init(allocator);
     defer converter.deinit();
 
-    var action: Action = .convert;
+    var action: Converter.Action = .convert;
     var no_more_options = false;
     for (args[1..]) |arg| {
         if (no_more_options) {
@@ -81,6 +154,9 @@ pub fn main() !void {
         } else if (mem.eql(u8, arg, "-h") or (mem.eql(u8, arg, "--help"))) {
             usage();
             return;
+        } else if (mem.eql(u8, arg, "--help-rules")) {
+            rule_help();
+            return;
         } else if (mem.eql(u8, arg, "--dry-run")) {
             action = .dry_run;
         } else if (mem.eql(u8, arg, "--dry-run-highlight")) {
@@ -89,15 +165,34 @@ pub fn main() !void {
             converter.adult_camels = true;
         } else if (mem.eql(u8, arg, "--convert-all")) {
             converter.convert_by_default = true;
-        } else if (get_flag_value(arg, "--convert")) |name| {
-            const rep = get_kv_val(name); // Optional explicit replacement value
-            _ = try converter.register_replacement(name, rep);
-        } else if (get_flag_value(arg, "--convert-list")) |path| {
-            try converter.load_conversion_list(path);
+        } else if (get_flag_value(arg, "--convert")) |kv| {
+            var iter = mem.split(u8, kv, "=");
+            const name = iter.first();
+            const rep = iter.rest(); // Optional replacement token
+            _ = converter.register_replacement(name, rep) catch |err| switch (err) {
+                error.InvalidIdentifier => {
+                    log.err("invalid identifier in --convert: {s} = {s}", .{ name, rep });
+                    os.exit(1);
+                },
+                else => return err,
+            };
         } else if (get_flag_value(arg, "--except")) |name| {
-            try converter.register_exclusion(name);
-        } else if (get_flag_value(arg, "--except-list")) |path| {
-            try converter.load_exception_list(path);
+            converter.register_exclusion(name) catch |err| switch (err) {
+                error.InvalidIdentifier => {
+                    log.err("invalid identifier in --except: {s}", .{name});
+                    os.exit(1);
+                },
+                else => return err,
+            };
+        } else if (get_flag_value(arg, "--load-rules")) |path| {
+            const res = try converter.load_rules_from_file(path);
+            switch (res) {
+                .ok => {},
+                .fail => |fail| {
+                    log.err("{s}:{}: {s}", .{ path, fail.line, Rule.error_string(fail.err) });
+                    os.exit(1);
+                },
+            }
         } else if (get_flag_value(arg, "--ignore-path")) |path| {
             const abs_path = try fs.cwd().realpathAlloc(allocator, path);
             try converter.ignore_file_set.put(converter.arena.allocator(), abs_path, {});
@@ -119,12 +214,6 @@ pub fn main() !void {
     try converter.process_files(paths.items, action);
 }
 
-const Action = enum {
-    dry_run,
-    highlight,
-    convert,
-};
-
 const Converter = struct {
     arena: ArenaAllocator,
     ignore_file_set: std.StringHashMapUnmanaged(void),
@@ -133,8 +222,26 @@ const Converter = struct {
     convert_ident_map: std.StringHashMapUnmanaged([]const u8),
     /// Tokens explicitly disallowed from conversion.
     ignore_ident_set: std.StringHashMapUnmanaged(void),
+    /// Wildcard pattern storage. Longest rule matches first,
+    /// so this must be kept sorted by decsending length.
+    /// Wildcard matching is naive and would benefit from a trie
+    /// or other data structure when using many wildcards.
+    wildcard_rules: std.ArrayListUnmanaged(Wildcard),
     convert_by_default: bool,
     adult_camels: bool,
+
+    const Action = enum {
+        dry_run,
+        highlight,
+        convert,
+    };
+
+    const Wildcard = struct {
+        prefix: []const u8,
+        action: Wildcard.Action,
+
+        const Action = enum { ignore, replace };
+    };
 
     pub fn init(allocator: Allocator) Converter {
         return .{
@@ -143,6 +250,7 @@ const Converter = struct {
             .to_convert_file_set = .{},
             .convert_ident_map = .{},
             .ignore_ident_set = .{},
+            .wildcard_rules = .{},
             .convert_by_default = false,
             .adult_camels = false,
         };
@@ -161,76 +269,30 @@ const Converter = struct {
         }
     }
 
-    /// Register explicit replacements from a file.
-    /// File has this format:
-    ///
-    /// # comment
-    /// myFunc
-    /// ThisOneToo # other comment
-    ///
-    /// # blank lines are ok
-    /// otherFunc optional_explicit_replacement
-    pub fn load_conversion_list(self: *Converter, path: []const u8) !void {
+    pub const LoadRulesResult = union(enum) {
+        ok,
+        fail: Fail,
+
+        pub const Fail = struct {
+            line: usize,
+            err: Rule.Error,
+        };
+    };
+
+    pub fn load_rules_from_file(self: *Converter, path: []const u8) !LoadRulesResult {
         const f = try fs.cwd().openFile(path, .{});
         defer f.close();
 
         var line_buf: [200]u8 = undefined;
-        while (try f.reader().readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
-            var iter = mem.tokenize(u8, line, " ");
-            const ident = iter.next() orelse break;
-
-            if (ident[0] == '#') {
-                continue;
-            }
-            if (!is_valid_identifier(ident)) {
-                log.err("invalid identifier {s} in conversion list file {s}", .{ ident, path });
-                continue;
-            }
-
-            var replacement: ?[]const u8 = null;
-            if (iter.next()) |str| b: {
-                if (str[0] == '#') break :b;
-                if (mem.eql(u8, str, ident)) {
-                    replacement = ident;
-                } else {
-                    replacement = try self.arena.allocator().dupe(u8, str);
-                }
-            }
-            _ = try self.register_replacement(ident, replacement);
+        var line_no: usize = 0;
+        while (try f.reader().readUntilDelimiterOrEof(&line_buf, '\n')) |line| : (line_no += 1) {
+            const rule = Rule.parse(line) catch |err| return LoadRulesResult{ .fail = .{
+                .line = line_no,
+                .err = err,
+            } };
+            try self.register_rule(rule orelse continue);
         }
-    }
-
-    pub fn load_exception_list(self: *Converter, path: []const u8) !void {
-        const f = try fs.cwd().openFile(path, .{});
-        defer f.close();
-
-        var line_buf: [200]u8 = undefined;
-        while (try f.reader().readUntilDelimiterOrEof(&line_buf, '\n')) |line| {
-            var iter = mem.tokenize(u8, line, " ");
-            const ident = iter.next() orelse return;
-
-            if (ident[0] == '#') {
-                continue;
-            }
-            if (!is_valid_identifier(ident)) {
-                log.err("invalid identifier {s} in exception list file {s}", .{ ident, path });
-                continue;
-            }
-
-            try self.register_exclusion(ident);
-        }
-    }
-
-    fn is_valid_identifier(str: []const u8) bool {
-        assert(str.len > 0);
-        for (str, 0..) |c, i| {
-            switch (c) {
-                'A'...'Z', 'a'...'z', '_' => {},
-                '0'...'9' => if (i == 0) return false,
-                else => return false,
-            }
-        }
-        return true;
+        return LoadRulesResult.ok;
     }
 
     fn scan_path(self: *Converter, dir: fs.Dir, path: []const u8) !void {
@@ -332,6 +394,7 @@ const Converter = struct {
     }
 
     /// Returns null if the token should not be replaced.
+    /// Caches result if token has not been seen previously.
     fn get_replacement(self: *Converter, token: []const u8) !?[]const u8 {
         if (self.ignore_ident_set.contains(token)) {
             return null;
@@ -339,6 +402,13 @@ const Converter = struct {
         if (self.convert_ident_map.get(token)) |val| {
             return val;
         }
+        if (self.get_wildcard_match(token)) |action| switch (action) {
+            .replace => return try self.register_replacement(token, null),
+            .ignore => {
+                try self.register_exclusion(token);
+                return null;
+            },
+        };
         if (!self.convert_by_default) {
             return null;
         }
@@ -349,6 +419,33 @@ const Converter = struct {
             return null;
         }
         return try self.register_replacement(token, null);
+    }
+
+    fn get_wildcard_match(self: *Converter, token: []const u8) ?Wildcard.Action {
+        for (self.wildcard_rules.items) |wc| {
+            if (mem.startsWith(u8, token, wc.prefix)) return wc.action;
+        }
+        return null;
+    }
+
+    pub fn register_rule(self: *Converter, rule: Rule) !void {
+        switch (rule.action) {
+            .ignore => {
+                _ = try self.register_exclusion(rule.token);
+            },
+            .ignore_wildcard => {
+                try self.register_wildcard(.{ .prefix = rule.token, .action = .ignore });
+            },
+            .replace => {
+                _ = try self.register_replacement(rule.token, null);
+            },
+            .replace_wildcard => {
+                try self.register_wildcard(.{ .prefix = rule.token, .action = .replace });
+            },
+            .replace_explicit => |sub| {
+                _ = try self.register_replacement(rule.token, sub);
+            },
+        }
     }
 
     /// Register a new token replacement and return it.
@@ -364,7 +461,10 @@ const Converter = struct {
     ) !?[]const u8 {
         assert(!self.convert_ident_map.contains(token));
 
+        if (!std.zig.isValidId(token)) return error.InvalidIdentifier;
+
         if (replacement) |rep| {
+            if (!std.zig.isValidId(rep)) return error.InvalidIdentifier;
             if (mem.eql(u8, token, rep)) {
                 try self.register_exclusion(token);
                 return null;
@@ -390,9 +490,41 @@ const Converter = struct {
         return rep_copy;
     }
 
+    /// Makes a copy of `token`.
     fn register_exclusion(self: *Converter, token: []const u8) !void {
+        if (!std.zig.isValidId(token)) return error.InvalidIdentifier;
         const token_copy = try self.arena.allocator().dupe(u8, token);
         try self.ignore_ident_set.put(self.arena.allocator(), token_copy, {});
+    }
+
+    /// Insert the rule and maintain lexicographical order.
+    /// No-op if rule already exists.
+    /// Error if new rule conflicts with an existing rule.
+    /// Makes a copy of the token if the rule is registered.
+    fn register_wildcard(self: *Converter, wc: Wildcard) !void {
+        if (!std.zig.isValidId(wc.prefix)) return error.InvalidIdentifier;
+        for (self.wildcard_rules.items, 0..) |existing, i| {
+            switch (mem.order(u8, existing.prefix, wc.prefix)) {
+                .eq => {
+                    if (existing.action == wc.action) return; // no-op
+                    return error.WildcardRuleConflict;
+                },
+                .lt => {
+                    const copy = try self.arena.allocator().dupe(u8, wc.prefix);
+                    try self.wildcard_rules.insert(self.arena.allocator(), i, .{
+                        .prefix = copy,
+                        .action = wc.action,
+                    });
+                    return;
+                },
+                .gt => {},
+            }
+        }
+        const copy = try self.arena.allocator().dupe(u8, wc.prefix);
+        try self.wildcard_rules.append(self.arena.allocator(), .{
+            .prefix = copy,
+            .action = wc.action,
+        });
     }
 };
 
@@ -459,6 +591,31 @@ fn testConvert(token: []const u8, expected: []const u8) !void {
     var fbs = std.io.fixedBufferStream(&buf);
     try convert_case(token, fbs.writer());
     try testing.expectEqualStrings(expected, fbs.getWritten());
+}
+
+test "wildcard match" {
+    var c = Converter.init(testing.allocator);
+    defer c.deinit();
+    try c.register_wildcard(.{ .prefix = "x", .action = .replace });
+    try c.register_wildcard(.{ .prefix = "M", .action = .replace });
+    try c.register_wildcard(.{ .prefix = "MOV", .action = .ignore });
+    try c.register_wildcard(.{ .prefix = "ffffff", .action = .ignore });
+    try c.register_wildcard(.{ .prefix = "chan", .action = .replace });
+    try c.register_wildcard(.{ .prefix = "MOVIE", .action = .replace });
+    try testWildcardMatch(&c, "hooba", null);
+    try testWildcardMatch(&c, "changeMe", .replace);
+    try testWildcardMatch(&c, "chonge", null);
+    try testWildcardMatch(&c, "cha", null);
+    try testWildcardMatch(&c, "MOVcc", .ignore);
+    try testWildcardMatch(&c, "MOV", .ignore);
+    try testWildcardMatch(&c, "MOVI", .ignore);
+    try testWildcardMatch(&c, "MOVIE", .replace);
+    try testWildcardMatch(&c, "MO", .replace);
+    try testWildcardMatch(&c, "M", .replace);
+}
+
+fn testWildcardMatch(c: *Converter, token: []const u8, expected: ?Converter.Wildcard.Action) !void {
+    try testing.expectEqual(expected, c.get_wildcard_match(token));
 }
 
 const Tokenizer = struct {
@@ -633,4 +790,6 @@ fn testTokenize(src: []const u8, expected: []const Tokenizer.Token) !void {
     }
 }
 
-const testing = std.testing;
+test {
+    _ = Rule;
+}
