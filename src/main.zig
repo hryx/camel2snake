@@ -32,6 +32,7 @@ fn usage() void {
         \\  --convert-all           Convert identifiers by default, except those explicitly excluded
         \\  --convert=IDENT[=SUB]   Convert instances of IDENT to snake case, replacing with SUB or using default strategy
         \\  --except=IDENT          Do not convert instances of IDENT to snake case
+        \\  --convert-builtins      Process Zig @builtins (ignored by default)
         \\  --load-rules=FILE       Load matching rules from FILE
         \\  --ignore-path=PATH      Do not process file or directory at PATH
         \\  --adult-camels          If combined with --convert-all, additionally convert AdultCamels into Adult_Snakes
@@ -113,6 +114,14 @@ fn rule_help() void {
         \\and convert them as well. This option is not required to match or replace
         \\such tokens if they match an explicit rule as decribed above.
         \\
+        \\Zig builtins like @popCount() are ignored. To process them, use
+        \\--convert-builtins. This flag can be combined with --adult-camels
+        \\to change builtins like @TypeOf(). Builtins cannot have explicit
+        \\conversions, only the default one.
+        \\
+        \\Zig keywords are never camel case so they are always ignored.
+        \\Adding them to a rule list or --convert option will have no effect.
+        \\
         \\When in doubt, use the --dry-run-highlight flag to preview the changes
         \\that would take effect with any combination of rules and options.
         \\
@@ -191,6 +200,8 @@ pub fn main() !void {
                 },
                 else => return err,
             };
+        } else if (mem.eql(u8, arg, "--convert-builtins")) {
+            converter.process_builtins = true;
         } else if (get_flag_value(arg, "--load-rules")) |path| {
             const res = try converter.load_rules_from_file(path);
             switch (res) {
@@ -283,6 +294,7 @@ const Converter = struct {
     wildcard_rules: std.ArrayListUnmanaged(Wildcard),
     convert_by_default: bool,
     adult_camels: bool,
+    process_builtins: bool,
     /// Record path of file being checked so caller can report errors.
     last_file_in_progress: []const u8,
 
@@ -317,6 +329,7 @@ const Converter = struct {
             .wildcard_rules = .{},
             .convert_by_default = false,
             .adult_camels = false,
+            .process_builtins = false,
             .last_file_in_progress = "",
         };
     }
@@ -448,6 +461,16 @@ const Converter = struct {
                         changed = true;
                     }
                 },
+                .builtin => {
+                    if (!self.process_builtins) continue;
+                    if (isUpper(tok.bytes[1])) {
+                        self.pappies_found += 1;
+                        changed = changed or (self.adult_camels and builtin_will_change(tok.bytes));
+                    } else {
+                        self.babbies_found += 1;
+                        changed = changed or builtin_will_change(tok.bytes);
+                    }
+                },
                 .ident_ish, .other_stuff => {},
             }
         }
@@ -471,6 +494,24 @@ const Converter = struct {
                             try writer.writeAll("[0m");
                         } else {
                             try writer.writeAll(rep);
+                        }
+                    } else {
+                        try writer.writeAll(tok.bytes);
+                    }
+                },
+                .builtin => {
+                    const adult = isUpper(tok.bytes[1]);
+                    if (self.process_builtins and (!adult or self.adult_camels) and builtin_will_change(tok.bytes)) {
+                        if (highlight) {
+                            const color = if (isUpper(tok.bytes[1])) "[35m" else "[36m";
+                            try writer.writeByte(0o033);
+                            try writer.writeAll(color);
+                            try writer.writeByte('@');
+                            try convert_case(tok.bytes[1..], writer);
+                            try writer.writeByte(0o033);
+                            try writer.writeAll("[0m");
+                        } else {
+                            try convert_case(tok.bytes, writer);
                         }
                     } else {
                         try writer.writeAll(tok.bytes);
@@ -622,6 +663,24 @@ const Converter = struct {
     }
 };
 
+fn builtin_will_change(token: []const u8) bool {
+    assert(token.len > 2);
+    assert(token[0] == '@');
+    for (token[2..]) |c| {
+        if (isUpper(c)) return true;
+    }
+    return false;
+}
+
+test "builtin camels" {
+    for (&[_][]const u8{ "@as", "@extern", "@This" }) |word| {
+        try testing.expectEqual(false, builtin_will_change(word));
+    }
+    for (&[_][]const u8{ "@popCount", "@intCast", "@cImport", "@TypeOf" }) |word| {
+        try testing.expectEqual(true, builtin_will_change(word));
+    }
+}
+
 const isUpper = std.ascii.isUpper;
 const isLower = std.ascii.isLower;
 const toLower = std.ascii.toLower;
@@ -724,6 +783,7 @@ const Tokenizer = struct {
             ident_ish,
             camel,
             adult_camel,
+            builtin,
             other_stuff,
         };
     };
@@ -740,6 +800,8 @@ const Tokenizer = struct {
         number_ish,
         ident_ish,
         backslash,
+        at,
+        builtin,
         unicode_escape,
         other_stuff,
     };
@@ -773,6 +835,7 @@ const Tokenizer = struct {
                         '_' => state = .ident_ish,
                         '0'...'9' => state = .number_ish,
                         '\\' => state = .backslash,
+                        '@' => state = .at,
                         else => state = .other_stuff,
                     }
                     self.index += 1;
@@ -808,6 +871,20 @@ const Tokenizer = struct {
                         break;
                     },
                 },
+                .at => switch (c) {
+                    'A'...'Z', 'a'...'z' => {
+                        state = .builtin;
+                        self.index += 1;
+                    },
+                    else => break,
+                },
+                .builtin => {
+                    switch (c) {
+                        'A'...'Z', 'a'...'z', '0'...'9', '_' => {},
+                        else => break,
+                    }
+                    self.index += 1;
+                },
                 .unicode_escape => switch (c) {
                     '}' => {
                         self.index += 1;
@@ -816,8 +893,7 @@ const Tokenizer = struct {
                     else => self.index += 1,
                 },
                 .other_stuff => switch (c) {
-                    'A'...'Z', 'a'...'z', '0'...'9', '_' => break,
-                    '\\' => break,
+                    'A'...'Z', 'a'...'z', '0'...'9', '_', '\\', '@' => break,
                     else => self.index += 1,
                 },
             }
@@ -826,15 +902,26 @@ const Tokenizer = struct {
         switch (state) {
             .start => return null,
             .ident_ish => {
-                if (capitalized and lower_count > 0 and upper_count > 1)
+                // Zig keywords are never camel case, and removing them from the
+                // pool now simplifies things later on.
+                if (std.zig.Token.getKeyword(bytes) != null) {
+                    return Token{ .bytes = bytes, .tag = .ident_ish };
+                }
+                if (capitalized and lower_count > 0 and upper_count > 1) {
                     return Token{ .bytes = bytes, .tag = .adult_camel };
-                if (!capitalized and lower_count > 0 and upper_count > 0)
+                }
+                if (!capitalized and lower_count > 0 and upper_count > 0) {
                     return Token{ .bytes = bytes, .tag = .camel };
+                }
                 return Token{ .bytes = bytes, .tag = .ident_ish };
+            },
+            .builtin => {
+                return Token{ .bytes = bytes, .tag = .builtin };
             },
             .other_stuff,
             .number_ish,
             .backslash,
+            .at,
             .unicode_escape,
             => return Token{ .bytes = bytes, .tag = .other_stuff },
         }
@@ -846,7 +933,7 @@ test "tokenize" {
         \\ [] {} 0x888.f000 :0x12Ab34Cd fn
         \\   babbyFunc.ComplexPappy,x_qwfpgjl
         \\%SixtyFour5();
-        \\ \u{Ab02}\xFF
+        \\ \u{Ab02}\xFF@@popCount?extern
     ,
         &.{
             .{ .tag = .other_stuff, .bytes = " [] {} " },
@@ -866,6 +953,10 @@ test "tokenize" {
             .{ .tag = .other_stuff, .bytes = "();\n " },
             .{ .tag = .other_stuff, .bytes = "\\u{Ab02}" },
             .{ .tag = .other_stuff, .bytes = "\\xFF" },
+            .{ .tag = .other_stuff, .bytes = "@" },
+            .{ .tag = .builtin, .bytes = "@popCount" },
+            .{ .tag = .other_stuff, .bytes = "?" },
+            .{ .tag = .ident_ish, .bytes = "extern" },
         },
     );
 }
