@@ -35,6 +35,7 @@ fn usage() void {
         \\  --ignore-path=PATH           Do not process file or directory at PATH
         \\  --adult-camels               If combined with --convert-all, additionally convert AdultCamels into Adult_Snakes
         \\  --fixup-compile-error-tests  Adjust expected errors in Zig compile error test suite
+        \\  --allow-non-zig-files        Process files that don't have a .zig extension
         \\  --dry-run                    Print files that would have changes (does not modify files)
         \\  --dry-run-highlight          Print files, colorizing affected tokens (does not modify files)
         \\  --max-file-kb=SIZE           Maximum file size in kilobytes (default 10000)
@@ -179,6 +180,8 @@ pub fn main() !void {
             converter.fixup_compile_error_tests = true;
         } else if (mem.eql(u8, arg, "--convert-all")) {
             converter.convert_by_default = true;
+        } else if (mem.eql(u8, arg, "--allow-non-zig-files")) {
+            converter.process_non_zig_files = true;
         } else if (get_flag_value(arg, "--convert")) |kv| {
             var iter = mem.split(u8, kv, "=");
             const name = iter.first();

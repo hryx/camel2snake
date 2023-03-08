@@ -27,6 +27,7 @@ wildcard_rules: std.ArrayListUnmanaged(Wildcard),
 convert_by_default: bool,
 adult_camels: bool,
 process_builtins: bool,
+process_non_zig_files: bool,
 fixup_compile_error_tests: bool,
 /// Record path of file being checked so caller can report errors.
 last_file_in_progress: []const u8,
@@ -87,6 +88,7 @@ pub fn init(allocator: Allocator) Converter {
         .adult_camels = false,
         .fixup_compile_error_tests = false,
         .process_builtins = false,
+        .process_non_zig_files = false,
         .last_file_in_progress = "",
         .line_increases = .{},
     };
@@ -151,7 +153,7 @@ fn scan_path(self: *Converter, dir: fs.Dir, path: []const u8) !void {
     const stat = try dir.statFile(abs_path);
     switch (stat.kind) {
         .File => {
-            if (mem.eql(u8, fs.path.extension(abs_path), ".zig")) {
+            if (mem.eql(u8, fs.path.extension(abs_path), ".zig") or self.process_non_zig_files) {
                 try self.to_convert_file_set.put(self.arena.allocator(), abs_path, .pending);
             }
         },
