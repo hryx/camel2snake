@@ -3,6 +3,7 @@ const fs = std.fs;
 const os = std.os;
 const log = std.log;
 const mem = std.mem;
+const fmt = std.fmt;
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const assert = std.debug.assert;
@@ -27,19 +28,20 @@ fn usage() void {
         \\
         \\Options:
         \\
-        \\  -h, --help              Print this help and exit
-        \\  --help-rules            Print help for identifier matching and replacement rules and exit
-        \\  --convert-all           Convert identifiers by default, except those explicitly excluded
-        \\  --convert=IDENT[=SUB]   Convert instances of IDENT to snake case, replacing with SUB or using default strategy
-        \\  --except=IDENT          Do not convert instances of IDENT to snake case
-        \\  --convert-builtins      Process Zig @builtins (ignored by default)
-        \\  --load-rules=FILE       Load matching rules from FILE
-        \\  --ignore-path=PATH      Do not process file or directory at PATH
-        \\  --adult-camels          If combined with --convert-all, additionally convert AdultCamels into Adult_Snakes
-        \\  --dry-run               Print files that would have changes (does not modify files)
-        \\  --dry-run-highlight     Print files, colorizing affected tokens (does not modify files)
-        \\  --max-file-kb=SIZE      Maximum file size in kilobytes (default 10000)
-        \\  --stats                 When finished, print some information about changes to stderr
+        \\  -h, --help                   Print this help and exit
+        \\  --help-rules                 Print help for identifier matching and replacement rules and exit
+        \\  --convert-all                Convert identifiers by default, except those explicitly excluded
+        \\  --convert=IDENT[=SUB]        Convert instances of IDENT to snake case, replacing with SUB or using default strategy
+        \\  --except=IDENT               Do not convert instances of IDENT to snake case
+        \\  --convert-builtins           Process Zig @builtins (ignored by default)
+        \\  --load-rules=FILE            Load matching rules from FILE
+        \\  --ignore-path=PATH           Do not process file or directory at PATH
+        \\  --adult-camels               If combined with --convert-all, additionally convert AdultCamels into Adult_Snakes
+        \\  --fixup-compile-error-tests  Adjust expected errors in Zig compile error test suite
+        \\  --dry-run                    Print files that would have changes (does not modify files)
+        \\  --dry-run-highlight          Print files, colorizing affected tokens (does not modify files)
+        \\  --max-file-kb=SIZE           Maximum file size in kilobytes (default 10000)
+        \\  --stats                      When finished, print some information about changes to stderr
         \\
     ;
     std.io.getStdErr().writeAll(text) catch unreachable;
@@ -176,6 +178,8 @@ pub fn main() !void {
             action = .highlight;
         } else if (mem.eql(u8, arg, "--adult-camels")) {
             converter.adult_camels = true;
+        } else if (mem.eql(u8, arg, "--fixup-compile-error-tests")) {
+            converter.fixup_compile_error_tests = true;
         } else if (mem.eql(u8, arg, "--convert-all")) {
             converter.convert_by_default = true;
         } else if (get_flag_value(arg, "--convert")) |kv| {
@@ -223,7 +227,7 @@ pub fn main() !void {
             };
             try converter.ignore_file_set.put(converter.arena.allocator(), abs_path, {});
         } else if (get_flag_value(arg, "--max-file-kb")) |val| {
-            max_file_size = try std.fmt.parseUnsigned(u32, val, 10) * 1000;
+            max_file_size = try fmt.parseUnsigned(u32, val, 10) * 1000;
         } else if (mem.eql(u8, arg, "--stats")) {
             print_stats = true;
         } else if (mem.startsWith(u8, arg, "-")) {
@@ -249,11 +253,12 @@ pub fn main() !void {
         const time_diff = end_time - start_time;
         const seconds = @intToFloat(f64, time_diff) / std.time.ns_per_s;
         if (print_stats) {
+            const counts = converter.count_changed_files();
             const std_err = std.io.getStdErr().writer();
             std_err.print("Summary of changes:\n", .{}) catch {};
             std_err.print("  Time taken: {d:.5} seconds\n", .{seconds}) catch {};
             std_err.print("  Files found: {}\n", .{converter.to_convert_file_set.count()}) catch {};
-            std_err.print("  Files changed: {}\n", .{converter.files_changed}) catch {};
+            std_err.print("  Files changed: {}\n", .{counts.converted}) catch {};
             std_err.print("  Camel case tokens found:\n", .{}) catch {};
             std_err.print("    Lower: {}\n", .{converter.babbies_found}) catch {};
             std_err.print("    Upper: {}\n", .{converter.pappies_found}) catch {};
@@ -266,6 +271,7 @@ pub fn main() !void {
             std_err.print("    Converted: {}\n", .{converter.unique_replacements}) catch {};
             std_err.print("    Excluded or canonical: {}\n", .{converter.unique_exclusions}) catch {};
             std_err.print("    Total: {}\n", .{converter.unique_replacements + converter.unique_exclusions}) catch {};
+            std_err.print("  Error tests fixed up: {}\n", .{counts.fixuped}) catch {};
         }
     }
 
@@ -282,7 +288,7 @@ pub fn main() !void {
 const Converter = struct {
     arena: ArenaAllocator,
     ignore_file_set: std.StringHashMapUnmanaged(void),
-    to_convert_file_set: std.StringArrayHashMapUnmanaged(void),
+    to_convert_file_set: std.StringArrayHashMapUnmanaged(enum { pending, skipped, converted, fixuped }),
     /// Stores both explicit conversions and cached previous conversions.
     convert_ident_map: std.StringHashMapUnmanaged([]const u8),
     /// Tokens explicitly disallowed from conversion.
@@ -295,8 +301,10 @@ const Converter = struct {
     convert_by_default: bool,
     adult_camels: bool,
     process_builtins: bool,
+    fixup_compile_error_tests: bool,
     /// Record path of file being checked so caller can report errors.
     last_file_in_progress: []const u8,
+    line_increases: LineIncreases.Map,
 
     babbies_found: u32 = 0,
     babbies_changed: u32 = 0,
@@ -304,7 +312,29 @@ const Converter = struct {
     pappies_changed: u32 = 0,
     unique_exclusions: u32 = 0,
     unique_replacements: u32 = 0,
-    files_changed: u32 = 0,
+
+    const LineIncreases = struct {
+        const Map = std.ArrayHashMapUnmanaged(K, std.ArrayListUnmanaged(V), LineIncreases, false);
+
+        pub fn hash(_: LineIncreases, key: K) u32 {
+            const str_hash = @truncate(u32, std.hash_map.hashString(key.path));
+            return str_hash ^ key.line;
+        }
+
+        pub fn eql(_: LineIncreases, a: K, b: K, _: usize) bool {
+            if (a.line != b.line) return false;
+            return mem.eql(u8, a.path, b.path);
+        }
+
+        const K = struct {
+            path: []const u8,
+            line: u32,
+        };
+        const V = struct {
+            column: u32,
+            bytes_added: u16,
+        };
+    };
 
     const Action = enum {
         dry_run,
@@ -329,8 +359,10 @@ const Converter = struct {
             .wildcard_rules = .{},
             .convert_by_default = false,
             .adult_camels = false,
+            .fixup_compile_error_tests = false,
             .process_builtins = false,
             .last_file_in_progress = "",
+            .line_increases = .{},
         };
     }
 
@@ -349,6 +381,9 @@ const Converter = struct {
         }
         for (self.to_convert_file_set.keys()) |path| {
             try self.process_file(path, action, max_file_size);
+        }
+        if (self.fixup_compile_error_tests) {
+            try self.apply_all_compile_error_test_fixups(max_file_size);
         }
     }
 
@@ -391,7 +426,7 @@ const Converter = struct {
         switch (stat.kind) {
             .File => {
                 if (mem.eql(u8, fs.path.extension(abs_path), ".zig")) {
-                    try self.to_convert_file_set.put(self.arena.allocator(), abs_path, {});
+                    try self.to_convert_file_set.put(self.arena.allocator(), abs_path, .pending);
                 }
             },
             .Directory => {
@@ -420,12 +455,15 @@ const Converter = struct {
         defer allocator.free(src);
 
         const std_out = std.io.getStdOut().writer();
-        if (!try self.file_will_change(src)) return;
-        self.files_changed += 1;
+
+        if (!try self.file_will_change(src)) {
+            self.to_convert_file_set.putAssumeCapacity(path, .skipped);
+            return;
+        }
 
         switch (action) {
             .dry_run => {
-                try std_out.print("{s}\n", .{path});
+                try std_out.print("convert {s}\n", .{path});
             },
             .highlight => {
                 try self.write_with_changes(src, std_out, true);
@@ -437,9 +475,33 @@ const Converter = struct {
 
                 try self.write_with_changes(src, af.file.writer(), false);
                 try af.finish();
-                try std_out.print("{s}\n", .{path});
+                try std_out.print("convert {s}\n", .{path});
             },
         }
+
+        self.to_convert_file_set.putAssumeCapacity(path, .converted);
+    }
+
+    const ChangeCounts = struct {
+        skipped: u32 = 0,
+        converted: u32 = 0,
+        fixuped: u32 = 0,
+    };
+    fn count_changed_files(self: *Converter) ChangeCounts {
+        var iter = self.to_convert_file_set.iterator();
+        var counts = ChangeCounts{};
+        while (iter.next()) |item| {
+            switch (item.value_ptr.*) {
+                .pending => unreachable,
+                .skipped => counts.skipped += 1,
+                .converted => counts.converted += 1,
+                .fixuped => {
+                    counts.converted += 1;
+                    counts.fixuped += 1;
+                },
+            }
+        }
+        return counts;
     }
 
     fn file_will_change(self: *Converter, src: []const u8) !bool {
@@ -477,6 +539,39 @@ const Converter = struct {
         return changed;
     }
 
+    /// old_tok must be a slice of src, not a copy.
+    /// For builtins, only pass the name portion and set is_builtin to true.
+    ///
+    /// TODO: Calling get_slice_location() for every camel token is O(N²).
+    fn track_change(
+        self: *Converter,
+        src: []const u8,
+        old_tok: []const u8,
+        new_tok: []const u8,
+        is_builtin: bool,
+    ) !void {
+        const diff = new_tok.len - old_tok.len;
+        if (diff == 0) return;
+
+        var loc = get_slice_location(src, old_tok);
+        if (is_builtin) {
+            assert(loc.column != 0);
+            assert((old_tok.ptr - 1)[0] == '@');
+            loc.column -= 1;
+        }
+        const gop = try self.line_increases.getOrPut(self.arena.allocator(), .{
+            .path = self.last_file_in_progress,
+            .line = @intCast(u32, loc.line),
+        });
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        try gop.value_ptr.append(self.arena.allocator(), .{
+            .column = @intCast(u32, loc.column),
+            .bytes_added = @intCast(u16, diff),
+        });
+    }
+
     fn write_with_changes(self: *Converter, src: []const u8, w: anytype, highlight: bool) !void {
         var bw = std.io.bufferedWriter(w);
         const writer = bw.writer();
@@ -485,6 +580,8 @@ const Converter = struct {
             switch (tok.tag) {
                 .camel, .adult_camel => {
                     if (try self.get_replacement(tok.bytes)) |rep| {
+                        try self.track_change(src, tok.bytes, rep, false);
+
                         if (highlight) {
                             const color = if (tok.tag == .camel) "[32m" else "[33m";
                             try writer.writeByte(0o033);
@@ -502,16 +599,23 @@ const Converter = struct {
                 .builtin => {
                     const adult = isUpper(tok.bytes[1]);
                     if (self.process_builtins and (!adult or self.adult_camels) and builtin_will_change(tok.bytes)) {
+                        var buf: [30]u8 = undefined;
+                        var fbs = std.io.fixedBufferStream(&buf);
+                        try convert_case(tok.bytes[1..], fbs.writer());
+                        const rep = fbs.getWritten();
+                        try self.track_change(src, tok.bytes[1..], rep, true);
+
                         if (highlight) {
-                            const color = if (isUpper(tok.bytes[1])) "[35m" else "[36m";
+                            const color = if (adult) "[35m" else "[36m";
                             try writer.writeByte(0o033);
                             try writer.writeAll(color);
                             try writer.writeByte('@');
-                            try convert_case(tok.bytes[1..], writer);
+                            try writer.writeAll(rep);
                             try writer.writeByte(0o033);
                             try writer.writeAll("[0m");
                         } else {
-                            try convert_case(tok.bytes, writer);
+                            try writer.writeByte('@');
+                            try writer.writeAll(rep);
                         }
                     } else {
                         try writer.writeAll(tok.bytes);
@@ -661,12 +765,210 @@ const Converter = struct {
             .action = wc.action,
         });
     }
+
+    /// Parse error message comments like those found in test/cases/compile_errors
+    /// and update the expected column numbers based on how the new source has shifted
+    /// due to changing camel case to snake case. Files not formatted in the expected
+    /// way are ignored, and error messages that refer to unaffected lines are ignored.
+    fn apply_all_compile_error_test_fixups(self: *Converter, max_file_size: u32) !void {
+        var file_iter = self.to_convert_file_set.iterator();
+        while (file_iter.next()) |item| {
+            if (item.value_ptr.* != .converted) continue;
+            const path = item.key_ptr.*;
+            const src = try fs.cwd().readFileAlloc(self.arena.child_allocator, path, max_file_size);
+            defer self.arena.child_allocator.free(src);
+
+            var af = try fs.cwd().atomicFile(path, .{});
+            defer af.deinit();
+
+            self.last_file_in_progress = path;
+            const changed = try self.apply_compile_error_test_fixups(src, af.file.writer());
+            if (changed) {
+                try std.io.getStdOut().writer().print("fixup {s}\n", .{path});
+                self.to_convert_file_set.putAssumeCapacity(path, .fixuped);
+                try af.finish();
+            }
+        }
+    }
+
+    fn apply_compile_error_test_fixups(self: *Converter, src: []const u8, w: anytype) !bool {
+        var bw = std.io.bufferedWriter(w);
+        const writer = bw.writer();
+
+        const Change = struct {
+            err_msg_line: u32, // 0-indexed
+            reported_line: u32, // 0-indexed
+            new_column: u32, // 0-indexed
+            line_prefix: []const u8, // everything before ":line:col"
+            line_remainder: []const u8, // everything after ":line:col"
+        };
+        var changes = std.ArrayList(Change).init(self.arena.child_allocator);
+        defer changes.deinit();
+
+        const path = self.last_file_in_progress;
+
+        var lines_backwards = mem.splitBackwards(u8, src, "\n");
+        while (lines_backwards.next()) |line| {
+            if (!mem.startsWith(u8, mem.trimLeft(u8, line, " "), "//")) continue;
+            const line_err_start = mem.trimLeft(u8, line, " /");
+            if (line_err_start.len == 0) continue;
+            const line_err_start_offset = @ptrToInt(line_err_start.ptr) - @ptrToInt(line.ptr);
+            const line_prefix = line[0 .. line_err_start_offset + 1];
+
+            var number_iter = mem.tokenize(u8, line_err_start, ":");
+
+            const err_line_str = number_iter.next() orelse continue;
+            const err_line = if (fmt.parseInt(u32, err_line_str, 10)) |line_no| b: {
+                if (line_no == 0) continue; // Error messages are 1-indexed, should not occur
+                break :b line_no - 1;
+            } else |_| continue;
+
+            // Don't fix up the error message comments themselves
+            const err_msg_line = @intCast(u32, get_slice_location(src, line).line);
+            if (err_line == err_msg_line) continue;
+
+            const err_col_str = number_iter.next() orelse continue;
+            const err_col = if (fmt.parseInt(u32, err_col_str, 10)) |col_no| b: {
+                if (col_no == 0) continue; // Error messages are 1-indexed, should not occur
+                break :b col_no - 1;
+            } else |_| continue;
+
+            var new_err_col = err_col;
+            const incrs = self.line_increases.get(.{ .path = path, .line = err_line }) orelse continue;
+            for (incrs.items) |incr| {
+                if (incr.column < err_col) {
+                    new_err_col += incr.bytes_added;
+                }
+            }
+            if (new_err_col == err_col) continue;
+
+            try changes.append(.{
+                .err_msg_line = err_msg_line,
+                .reported_line = err_line,
+                .new_column = new_err_col,
+                .line_prefix = line_prefix,
+                .line_remainder = number_iter.rest(),
+            });
+        }
+
+        if (changes.items.len == 0) return false;
+
+        var lines = mem.split(u8, src, "\n");
+        var next_change = changes.popOrNull();
+        var line_i: u32 = 0;
+        while (lines.next()) |line| : (line_i += 1) {
+            const change = next_change orelse {
+                try writer.writeAll(line);
+                try writer.writeByte('\n');
+                try writer.writeAll(lines.rest());
+                break;
+            };
+            if (line_i == change.err_msg_line) {
+                // "// :line:col: ..."
+                try writer.writeAll(change.line_prefix);
+                try fmt.formatInt(change.reported_line + 1, 10, .lower, .{}, writer);
+                try writer.writeByte(':');
+                try fmt.formatInt(change.new_column + 1, 10, .lower, .{}, writer);
+                try writer.writeByte(':');
+                try writer.writeAll(change.line_remainder);
+                try writer.writeByte('\n');
+                next_change = changes.popOrNull();
+            } else {
+                try writer.writeAll(line);
+                try writer.writeByte('\n');
+            }
+        } else try writer.writeAll(lines.rest()); // trailing newlines
+
+        try bw.flush();
+        return true;
+    }
 };
 
+test "convert and apply error test fixups" {
+    var c = Converter.init(testing.allocator);
+    defer c.deinit();
+
+    c.last_file_in_progress = "/tmp/fake/food.zig";
+    c.process_builtins = true;
+
+    const src =
+        \\
+        \\
+        \\const x = 100000;
+        \\const y = @intCast(u10, @intCast(u9, @as(u8, x)));
+        \\
+        \\
+        \\fn heck() void { return null; }
+        \\fn clob() usize { return @popCount(z); }
+        \\
+        \\// :4:38: error: wacky coercion
+        \\//  :4:38: note: it donut fit in a u8
+        \\//:7:25: error: expected 'void', found 'null literal'
+        \\// :8:36: error: undeclared identifier 'z'
+        \\// :?:101: note: more info over here
+        \\
+    ;
+
+    var buf1: [src.len + 10]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf1);
+    try c.write_with_changes(src, fbs.writer(), false);
+    const altered = fbs.getWritten();
+
+    try testing.expectEqualStrings(
+        \\
+        \\
+        \\const x = 100000;
+        \\const y = @int_cast(u10, @int_cast(u9, @as(u8, x)));
+        \\
+        \\
+        \\fn heck() void { return null; }
+        \\fn clob() usize { return @pop_count(z); }
+        \\
+        \\// :4:38: error: wacky coercion
+        \\//  :4:38: note: it donut fit in a u8
+        \\//:7:25: error: expected 'void', found 'null literal'
+        \\// :8:36: error: undeclared identifier 'z'
+        \\// :?:101: note: more info over here
+        \\
+    , altered);
+
+    var buf2: [src.len + 10]u8 = undefined;
+    fbs = std.io.fixedBufferStream(&buf2);
+    const changed = try c.apply_compile_error_test_fixups(altered, fbs.writer());
+    try testing.expect(changed);
+    const fixuped = fbs.getWritten();
+
+    try testing.expectEqualStrings(
+        \\
+        \\
+        \\const x = 100000;
+        \\const y = @int_cast(u10, @int_cast(u9, @as(u8, x)));
+        \\
+        \\
+        \\fn heck() void { return null; }
+        \\fn clob() usize { return @pop_count(z); }
+        \\
+        \\// :4:40: error: wacky coercion
+        \\//  :4:40: note: it donut fit in a u8
+        \\//:7:25: error: expected 'void', found 'null literal'
+        \\// :8:37: error: undeclared identifier 'z'
+        \\// :?:101: note: more info over here
+        \\
+    , fixuped);
+}
+
+fn get_slice_location(in_src: []const u8, token: []const u8) std.zig.Loc {
+    const byte_offset = @ptrToInt(token.ptr) - @ptrToInt(in_src.ptr);
+    return std.zig.findLineColumn(in_src, byte_offset);
+}
+
+/// Assumes the builtin is either a valid camel case Zig builtin
+/// or one that has already been converted to snake case.
 fn builtin_will_change(token: []const u8) bool {
-    assert(token.len > 2);
     assert(token[0] == '@');
+    if (token.len < 2) return false;
     for (token[2..]) |c| {
+        if (c == '_') return false;
         if (isUpper(c)) return true;
     }
     return false;
