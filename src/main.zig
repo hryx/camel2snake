@@ -45,90 +45,6 @@ fn usage() void {
     std.io.getStdErr().writeAll(text) catch unreachable;
 }
 
-fn rule_help() void {
-    const text =
-        \\camel2snake identifier matching and replacement rules
-        \\
-        \\camel2snake identifies all camel case tokens in files it reads,
-        \\but by default, it will leave them all unchanged. Beavhior can
-        \\be changed either by specifying individual patterns as
-        \\command-line options or by pointing to files containing rules.
-        \\
-        \\Any of the options mentioned below can be specified multiple times.
-        \\In all cases, tokens must be valid C/Zig identifiers, i.e. they
-        \\must match the regular expression:
-        \\
-        \\    [A-Za-z_][A-Za-z0-9_]*
-        \\
-        \\The simplest option is --convert-all, which changes the baseline
-        \\behavior from ignoring camel case tokens to replacing them with
-        \\snake case equivalents. In other words, this changes the baseline
-        \\behavior from opt-in to opt-out. Further options can add exceptions
-        \\(tokens to explicitly ignore) or explicit substitution tokens.
-        \\
-        \\The --except=IDENT option ensures that tokens matching IDENT exactly
-        \\will not be altered, even if other options have enabled token
-        \\conversion. Explicit exclusions have the highest precedence.
-        \\
-        \\The --convert=IDENT option specifies a token which should be replaced
-        \\using the default camel case -> snake case conversion algorithm.
-        \\The form --convert=IDENT=SUB will replace all instances of the token
-        \\IDENT with exact value SUB. This can be used for individual overrides
-        \\when the default conversion strategy produces undesirable output.
-        \\
-        \\For anything more complicated, use the --load-rules=FILE option.
-        \\The file at path FILE is a plain text file with syntax and behavior
-        \\described by the following example.
-        \\
-        \\    # Comments and blank line are ignored.
-        \\    # Comments may appear on their own on the same line as a rule.
-        \\
-        \\    # Replace all instances of a token with the default strategy.
-        \\    myThing
-        \\
-        \\    # Replace all instances of a token with an explicit value.
-        \\    myAPIthing my_api_thing
-        \\
-        \\    # Ignore all instances of a token.
-        \\    # Only the first character may be a '!'.
-        \\    !MOVcc # name of opcode
-        \\    !macOS # brand name
-        \\
-        \\    # Wildcards may be used to match all tokens with a certain prefix.
-        \\    # Only the last character may be a '*'.
-        \\    # Wildcards can only use the default replacement strategy,
-        \\    # not explicit replacements.
-        \\    HttpError*
-        \\
-        \\    # Wildcards can also be used in exclusion rules.
-        \\    !GLFW*
-        \\    !SDL_*
-        \\
-        \\Wildcards have the lowest precedence; tokens are compared for exact
-        \\matches before being checked against wildcard matches. If both a
-        \\replacement and exclusion rule for the same wildcard pattern is found,
-        \\the program returns an error.
-        \\
-        \\By default, camel case tokens that start with a capital letter are
-        \\ignored. Use --adult-camels *in addition to* --convert-all to match
-        \\and convert them as well. This option is not required to match or replace
-        \\such tokens if they match an explicit rule as decribed above.
-        \\
-        \\Zig builtins like @popCount() are ignored. To process them, use
-        \\--convert-builtins. This flag can be combined with --adult-camels
-        \\to change builtins like @TypeOf(). Builtins cannot have explicit
-        \\conversions, only the default one.
-        \\
-        \\Zig keywords are never camel case so they are always ignored.
-        \\Adding them to a rule list or --convert option will have no effect.
-        \\
-        \\When in doubt, use the --dry-run-highlight flag to preview the changes
-        \\that would take effect with any combination of rules and options.
-        \\
-    ;
-    std.io.getStdErr().writeAll(text) catch unreachable;
-}
-
 fn get_flag_value(arg: []const u8, flag: [:0]const u8) ?[]const u8 {
     var iter = mem.split(u8, arg, "=");
     if (mem.eql(u8, iter.first(), flag)) return iter.rest();
@@ -168,7 +84,8 @@ pub fn main() !void {
             usage();
             return;
         } else if (mem.eql(u8, arg, "--help-rules")) {
-            rule_help();
+            const text = @embedFile("../doc/rules.txt");
+            std.io.getStdErr().writeAll(text) catch unreachable;
             return;
         } else if (mem.eql(u8, arg, "--dry-run")) {
             action = .dry_run;

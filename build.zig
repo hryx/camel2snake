@@ -10,6 +10,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Allows embedding files in doc/
+    exe.setMainPkgPath(".");
 
     exe.install();
 
