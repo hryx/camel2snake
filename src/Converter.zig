@@ -13,7 +13,11 @@ const Tokenizer = @import("Tokenizer.zig");
 const Converter = @This();
 
 arena: ArenaAllocator,
-ignore_file_set: std.StringHashMapUnmanaged(void),
+/// Patterns to ignore. Can be either a file or directory name.
+/// Any path ending in this will be ignored, so e.g. "zig-cache" will match
+/// "zig-cache", "test/something/zig-cache", "zig-cache", etc.
+/// Names are prefixed with filesystem separator to make matching simpler.
+ignore_paths: std.ArrayListUnmanaged([]const u8),
 to_convert_file_set: std.StringArrayHashMapUnmanaged(enum { pending, skipped, converted, fixuped }),
 /// Stores both explicit conversions and cached previous conversions.
 convert_ident_map: std.StringHashMapUnmanaged([]const u8),
@@ -79,7 +83,7 @@ const Wildcard = struct {
 pub fn init(allocator: Allocator) Converter {
     return .{
         .arena = ArenaAllocator.init(allocator),
-        .ignore_file_set = .{},
+        .ignore_paths = .{},
         .to_convert_file_set = .{},
         .convert_ident_map = .{},
         .ignore_ident_set = .{},
@@ -96,6 +100,40 @@ pub fn init(allocator: Allocator) Converter {
 
 pub fn deinit(self: *Converter) void {
     self.arena.deinit();
+}
+
+pub fn add_ignore_path(self: *Converter, file_or_dir_name: []const u8) !void {
+    const pattern = try fs.path.resolve(self.arena.allocator(), &.{ "/", file_or_dir_name });
+    try self.ignore_paths.append(self.arena.allocator(), pattern);
+}
+
+fn should_ignore(self: *Converter, abs_path: []const u8) bool {
+    for (self.ignore_paths.items) |suffix| {
+        if (mem.endsWith(u8, abs_path, suffix)) return true;
+    }
+    return false;
+}
+
+test should_ignore {
+    var c = Converter.init(testing.allocator);
+    defer c.deinit();
+    try c.add_ignore_path("zig-cache");
+    try c.add_ignore_path("./myfile.zig");
+    try c.add_ignore_path("/////other");
+    try c.add_ignore_path("sub/special");
+    try testing.expect(!c.should_ignore("zig-cache"));
+    try testing.expect(c.should_ignore("/zig-cache"));
+    try testing.expect(!c.should_ignore("/zig-cache2"));
+    try testing.expect(c.should_ignore("/home/you/zig-cache"));
+    try testing.expect(c.should_ignore("/home/you/myfile.zig"));
+    try testing.expect(!c.should_ignore("/home/you/amyfile.zig"));
+    try testing.expect(c.should_ignore("/other"));
+    try testing.expect(c.should_ignore("../other"));
+    try testing.expect(!c.should_ignore("/another"));
+    try testing.expect(!c.should_ignore("/other.zig"));
+    try testing.expect(c.should_ignore("/tmp/sub/special"));
+    try testing.expect(!c.should_ignore("/tmp/sub"));
+    try testing.expect(!c.should_ignore("/tmp/special"));
 }
 
 pub fn process_files(
@@ -146,9 +184,7 @@ fn scan_path(self: *Converter, dir: fs.Dir, path: []const u8) !void {
 
     const abs_path = try dir.realpathAlloc(self.arena.allocator(), path);
 
-    if (self.ignore_file_set.contains(abs_path)) {
-        return;
-    }
+    if (self.should_ignore(abs_path)) return;
 
     const stat = try dir.statFile(abs_path);
     switch (stat.kind) {

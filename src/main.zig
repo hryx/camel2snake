@@ -32,7 +32,7 @@ fn usage() void {
         \\  --except=IDENT               Do not convert instances of IDENT to snake case
         \\  --convert-builtins           Process Zig @builtins (ignored by default)
         \\  --load-rules=FILE            Load matching rules from FILE
-        \\  --ignore-path=PATH           Do not process file or directory at PATH
+        \\  --ignore-path=NAME           Do not process files or directories matching NAME
         \\  --adult-camels               If combined with --convert-all, additionally convert AdultCamels into Adult_Snakes
         \\  --fixup-compile-error-tests  Adjust expected errors in Zig compile error test suite
         \\  --allow-non-zig-files        Process files that don't have a .zig extension
@@ -216,16 +216,7 @@ pub fn main() !void {
                 },
             }
         } else if (get_flag_value(arg, "--ignore-path")) |path| {
-            const abs_path = fs.cwd().realpathAlloc(converter.arena.allocator(), path) catch |err| {
-                switch (err) {
-                    error.FileNotFound => {
-                        log.warn("{s}: file does not exist, skipping", .{arg});
-                        continue;
-                    },
-                    else => return err,
-                }
-            };
-            try converter.ignore_file_set.put(converter.arena.allocator(), abs_path, {});
+            try converter.add_ignore_path(path);
         } else if (get_flag_value(arg, "--max-file-kb")) |val| {
             max_file_size = try fmt.parseUnsigned(u32, val, 10) * 1000;
         } else if (mem.eql(u8, arg, "--stats")) {
