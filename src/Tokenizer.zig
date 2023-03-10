@@ -14,6 +14,7 @@ pub const Token = struct {
         camel,
         adult_camel,
         builtin,
+        newline,
         other_stuff,
     };
 };
@@ -66,6 +67,11 @@ pub fn next(self: *Tokenizer) ?Token {
                     '0'...'9' => state = .number_ish,
                     '\\' => state = .backslash,
                     '@' => state = .at,
+                    '\n' => {
+                        const bytes = self.src[self.index .. self.index + 1];
+                        self.index += 1;
+                        return Token{ .bytes = bytes, .tag = .newline };
+                    },
                     else => state = .other_stuff,
                 }
                 self.index += 1;
@@ -96,6 +102,7 @@ pub fn next(self: *Tokenizer) ?Token {
                     state = .unicode_escape;
                     self.index += 1;
                 },
+                '\n' => break,
                 else => {
                     self.index += 1;
                     break;
@@ -120,10 +127,11 @@ pub fn next(self: *Tokenizer) ?Token {
                     self.index += 1;
                     break;
                 },
+                '\n' => break,
                 else => self.index += 1,
             },
             .other_stuff => switch (c) {
-                'A'...'Z', 'a'...'z', '0'...'9', '_', '\\', '@' => break,
+                'A'...'Z', 'a'...'z', '0'...'9', '_', '\\', '@', '\n' => break,
                 else => self.index += 1,
             },
         }
@@ -159,27 +167,37 @@ pub fn next(self: *Tokenizer) ?Token {
 
 test "tokenize" {
     try testTokenize(
+        \\
         \\ [] {} 0x888.f000 :0x12Ab34Cd fn
         \\   babbyFunc.ComplexPappy,x_qwfpgjl
         \\%SixtyFour5();
+        \\
+        \\
         \\ \u{Ab02}\xFF@@popCount?extern
     ,
         &.{
+            .{ .tag = .newline, .bytes = "\n" },
             .{ .tag = .other_stuff, .bytes = " [] {} " },
             .{ .tag = .other_stuff, .bytes = "0x888.f000" },
             .{ .tag = .other_stuff, .bytes = " :" },
             .{ .tag = .other_stuff, .bytes = "0x12Ab34Cd" },
             .{ .tag = .other_stuff, .bytes = " " },
             .{ .tag = .ident_ish, .bytes = "fn" },
-            .{ .tag = .other_stuff, .bytes = "\n   " },
+            .{ .tag = .newline, .bytes = "\n" },
+            .{ .tag = .other_stuff, .bytes = "   " },
             .{ .tag = .camel, .bytes = "babbyFunc" },
             .{ .tag = .other_stuff, .bytes = "." },
             .{ .tag = .adult_camel, .bytes = "ComplexPappy" },
             .{ .tag = .other_stuff, .bytes = "," },
             .{ .tag = .ident_ish, .bytes = "x_qwfpgjl" },
-            .{ .tag = .other_stuff, .bytes = "\n%" },
+            .{ .tag = .newline, .bytes = "\n" },
+            .{ .tag = .other_stuff, .bytes = "%" },
             .{ .tag = .adult_camel, .bytes = "SixtyFour5" },
-            .{ .tag = .other_stuff, .bytes = "();\n " },
+            .{ .tag = .other_stuff, .bytes = "();" },
+            .{ .tag = .newline, .bytes = "\n" },
+            .{ .tag = .newline, .bytes = "\n" },
+            .{ .tag = .newline, .bytes = "\n" },
+            .{ .tag = .other_stuff, .bytes = " " },
             .{ .tag = .other_stuff, .bytes = "\\u{Ab02}" },
             .{ .tag = .other_stuff, .bytes = "\\xFF" },
             .{ .tag = .other_stuff, .bytes = "@" },

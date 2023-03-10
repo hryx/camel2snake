@@ -297,7 +297,7 @@ fn file_will_change(self: *Converter, src: []const u8) !bool {
                     changed = changed or builtin_will_change(tok.bytes);
                 }
             },
-            .ident_ish, .other_stuff => {},
+            .ident_ish, .other_stuff, .newline => {},
         }
     }
     return changed;
@@ -305,33 +305,32 @@ fn file_will_change(self: *Converter, src: []const u8) !bool {
 
 /// old_tok must be a slice of src, not a copy.
 /// For builtins, only pass the name portion and set is_builtin to true.
-///
-/// TODO: Calling get_slice_location() for every camel token is O(N²).
 fn track_change(
     self: *Converter,
-    src: []const u8,
     old_tok: []const u8,
     new_tok: []const u8,
     is_builtin: bool,
+    line: u32,
+    col: u32,
 ) !void {
     const diff = new_tok.len - old_tok.len;
     if (diff == 0) return;
+    var column = col;
 
-    var loc = get_slice_location(src, old_tok);
     if (is_builtin) {
-        assert(loc.column != 0);
+        assert(column != 0);
         assert((old_tok.ptr - 1)[0] == '@');
-        loc.column -= 1;
+        column -= 1;
     }
     const gop = try self.line_increases.getOrPut(self.arena.allocator(), .{
         .path = self.last_file_in_progress,
-        .line = @intCast(u32, loc.line),
+        .line = @intCast(u32, line),
     });
     if (!gop.found_existing) {
         gop.value_ptr.* = .{};
     }
     try gop.value_ptr.append(self.arena.allocator(), .{
-        .column = @intCast(u32, loc.column),
+        .column = @intCast(u32, column),
         .bytes_added = @intCast(u16, diff),
     });
 }
@@ -340,11 +339,18 @@ fn write_with_changes(self: *Converter, src: []const u8, w: anytype, highlight: 
     var bw = std.io.bufferedWriter(w);
     const writer = bw.writer();
     var tokenizer = Tokenizer.init(src);
+    var line: u32 = 0;
+    var column: u32 = 0;
     while (tokenizer.next()) |tok| {
         switch (tok.tag) {
+            .newline => {
+                line += 1;
+                column = 0;
+                try writer.writeByte('\n');
+            },
             .camel, .adult_camel => {
                 if (try self.get_replacement(tok.bytes)) |rep| {
-                    try self.track_change(src, tok.bytes, rep, false);
+                    try self.track_change(tok.bytes, rep, false, line, column);
 
                     if (highlight) {
                         const color = if (tok.tag == .camel) "[32m" else "[33m";
@@ -359,6 +365,7 @@ fn write_with_changes(self: *Converter, src: []const u8, w: anytype, highlight: 
                 } else {
                     try writer.writeAll(tok.bytes);
                 }
+                column += @intCast(u32, tok.bytes.len);
             },
             .builtin => {
                 const adult = isUpper(tok.bytes[1]);
@@ -367,7 +374,7 @@ fn write_with_changes(self: *Converter, src: []const u8, w: anytype, highlight: 
                     var fbs = std.io.fixedBufferStream(&buf);
                     try convert_case(tok.bytes[1..], fbs.writer());
                     const rep = fbs.getWritten();
-                    try self.track_change(src, tok.bytes[1..], rep, true);
+                    try self.track_change(tok.bytes[1..], rep, true, line, column);
 
                     if (highlight) {
                         const color = if (adult) "[35m" else "[36m";
@@ -384,9 +391,11 @@ fn write_with_changes(self: *Converter, src: []const u8, w: anytype, highlight: 
                 } else {
                     try writer.writeAll(tok.bytes);
                 }
+                column += @intCast(u32, tok.bytes.len);
             },
             .ident_ish, .other_stuff => {
                 try writer.writeAll(tok.bytes);
+                column += @intCast(u32, tok.bytes.len);
             },
         }
     }
