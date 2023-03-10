@@ -304,24 +304,16 @@ fn file_will_change(self: *Converter, src: []const u8) !bool {
 }
 
 /// old_tok must be a slice of src, not a copy.
-/// For builtins, only pass the name portion and set is_builtin to true.
 fn track_change(
     self: *Converter,
     old_tok: []const u8,
     new_tok: []const u8,
-    is_builtin: bool,
     line: u32,
-    col: u32,
+    column: u32,
 ) !void {
     const diff = new_tok.len - old_tok.len;
     if (diff == 0) return;
-    var column = col;
 
-    if (is_builtin) {
-        assert(column != 0);
-        assert((old_tok.ptr - 1)[0] == '@');
-        column -= 1;
-    }
     const gop = try self.line_increases.getOrPut(self.arena.allocator(), .{
         .path = self.last_file_in_progress,
         .line = @intCast(u32, line),
@@ -350,7 +342,7 @@ fn write_with_changes(self: *Converter, src: []const u8, w: anytype, highlight: 
             },
             .camel, .adult_camel => {
                 if (try self.get_replacement(tok.bytes)) |rep| {
-                    try self.track_change(tok.bytes, rep, false, line, column);
+                    try self.track_change(tok.bytes, rep, line, column);
 
                     if (highlight) {
                         const color = if (tok.tag == .camel) "[32m" else "[33m";
@@ -374,7 +366,7 @@ fn write_with_changes(self: *Converter, src: []const u8, w: anytype, highlight: 
                     var fbs = std.io.fixedBufferStream(&buf);
                     try convert_case(tok.bytes[1..], fbs.writer());
                     const rep = fbs.getWritten();
-                    try self.track_change(tok.bytes[1..], rep, true, line, column);
+                    try self.track_change(tok.bytes[1..], rep, line, column);
 
                     if (highlight) {
                         const color = if (adult) "[35m" else "[36m";
@@ -609,7 +601,7 @@ fn apply_compile_error_test_fixups(self: *Converter, src: []const u8, w: anytype
         var new_err_col = err_col;
         const incrs = self.line_increases.get(.{ .path = path, .line = err_line }) orelse continue;
         for (incrs.items) |incr| {
-            if (err_col > incr.column) {
+            if (incr.column < err_col) {
                 new_err_col += incr.bytes_added;
             }
         }
