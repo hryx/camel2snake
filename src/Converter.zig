@@ -609,7 +609,7 @@ fn apply_compile_error_test_fixups(self: *Converter, src: []const u8, w: anytype
         var new_err_col = err_col;
         const incrs = self.line_increases.get(.{ .path = path, .line = err_line }) orelse continue;
         for (incrs.items) |incr| {
-            if (incr.column < err_col) {
+            if (err_col > incr.column) {
                 new_err_col += incr.bytes_added;
             }
         }
@@ -626,16 +626,15 @@ fn apply_compile_error_test_fixups(self: *Converter, src: []const u8, w: anytype
 
     if (changes.items.len == 0) return false;
 
-    var lines = mem.split(u8, src, "\n");
     var next_change = changes.popOrNull();
     var line_i: u32 = 0;
-    while (lines.next()) |line| : (line_i += 1) {
+    var remaining_src = src;
+    while (true) : (line_i += 1) {
         const change = next_change orelse {
-            try writer.writeAll(line);
-            try writer.writeByte('\n');
-            try writer.writeAll(lines.rest());
+            try writer.writeAll(remaining_src);
             break;
         };
+        const nl_pos = mem.indexOfScalar(u8, remaining_src, '\n');
         if (line_i == change.err_msg_line) {
             // "// :line:col: ..."
             try writer.writeAll(change.line_prefix);
@@ -644,13 +643,22 @@ fn apply_compile_error_test_fixups(self: *Converter, src: []const u8, w: anytype
             try fmt.formatInt(change.new_column + 1, 10, .lower, .{}, writer);
             try writer.writeByte(':');
             try writer.writeAll(change.line_remainder);
-            try writer.writeByte('\n');
-            next_change = changes.popOrNull();
+            if (nl_pos) |pos| {
+                try writer.writeByte('\n');
+                remaining_src = remaining_src[pos + 1 ..];
+                next_change = changes.popOrNull();
+            } else break;
         } else {
-            try writer.writeAll(line);
-            try writer.writeByte('\n');
+            if (nl_pos) |pos| {
+                try writer.writeAll(remaining_src[0 .. pos + 1]);
+                remaining_src = remaining_src[pos + 1 ..];
+            } else {
+                try writer.writeAll(remaining_src);
+                break;
+            }
         }
-    } else try writer.writeAll(lines.rest()); // trailing newlines
+    }
+    assert(changes.items.len == 0);
 
     try bw.flush();
     return true;
